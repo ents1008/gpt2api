@@ -32,7 +32,7 @@ type refreshReq struct {
 }
 
 type loginResp struct {
-	User  *user.User       `json:"user"`
+	User  *user.User        `json:"user"`
 	Token *pkgjwt.TokenPair `json:"token"`
 }
 
@@ -43,7 +43,7 @@ func (h *Handler) Register(c *gin.Context) {
 		resp.BadRequest(c, err.Error())
 		return
 	}
-	u, err := h.svc.Register(c.Request.Context(), req.Email, req.Password, req.Nickname)
+	u, err := h.svc.Register(c.Request.Context(), req.Email, req.Password, req.Nickname, c.ClientIP())
 	if err != nil {
 		if errors.Is(err, ErrEmailExists) {
 			resp.Conflict(c, "email already registered")
@@ -59,6 +59,14 @@ func (h *Handler) Register(c *gin.Context) {
 		}
 		if errors.Is(err, ErrPasswordTooShort) {
 			resp.BadRequest(c, "password is too short")
+			return
+		}
+		if errors.Is(err, ErrRegisterIPCooldown) {
+			resp.RateLimited(c, "同一 IP 注册过于频繁,请稍后再试")
+			return
+		}
+		if errors.Is(err, ErrRegisterIPLimit) {
+			resp.RateLimited(c, "同一 IP 24 小时内注册次数过多")
 			return
 		}
 		resp.Internal(c, err.Error())

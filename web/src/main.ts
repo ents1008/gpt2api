@@ -13,6 +13,50 @@ import './styles/global.scss'
 import { useSiteStore } from './stores/site'
 import { printBrandToConsole, startBrandGuard } from './utils/brand'
 
+const CHUNK_RELOAD_KEY = 'jiyun.chunk-reload-target'
+
+function currentAppURL() {
+  return `${window.location.pathname}${window.location.search}${window.location.hash}`
+}
+
+function markAndReload(target = currentAppURL()) {
+  if (sessionStorage.getItem(CHUNK_RELOAD_KEY) === target) return
+  sessionStorage.setItem(CHUNK_RELOAD_KEY, target)
+  window.location.assign(target)
+}
+
+function clearReloadMarker() {
+  if (sessionStorage.getItem(CHUNK_RELOAD_KEY) === currentAppURL()) {
+    sessionStorage.removeItem(CHUNK_RELOAD_KEY)
+  }
+}
+
+function isChunkLoadError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || '')
+  const lower = message.toLowerCase()
+  return (
+    lower.includes('failed to fetch dynamically imported module') ||
+    lower.includes('importing a module script failed') ||
+    lower.includes('error loading dynamically imported module') ||
+    lower.includes('unable to preload css')
+  )
+}
+
+window.addEventListener('vite:preloadError', ((event: Event) => {
+  event.preventDefault()
+  markAndReload()
+}) as EventListener)
+
+router.onError((error, to) => {
+  if (isChunkLoadError(error)) {
+    markAndReload(to?.fullPath || currentAppURL())
+  }
+})
+
+router.afterEach(() => {
+  clearReloadMarker()
+})
+
 const app = createApp(App)
 
 const pinia = createPinia()

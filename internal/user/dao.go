@@ -57,9 +57,9 @@ func (d *DAO) GetByEmail(ctx context.Context, email string) (*User, error) {
 // Create 插入新用户,返回自增 id。
 func (d *DAO) Create(ctx context.Context, u *User) (uint64, error) {
 	res, err := d.db.ExecContext(ctx,
-		`INSERT INTO users (email, password_hash, nickname, group_id, role, status, credit_balance)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		u.Email, u.PasswordHash, u.Nickname, u.GroupID, u.Role, u.Status, u.CreditBalance,
+		`INSERT INTO users (email, password_hash, nickname, group_id, role, status, credit_balance, register_ip)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		u.Email, u.PasswordHash, u.Nickname, u.GroupID, u.Role, u.Status, u.CreditBalance, u.RegisterIP,
 	)
 	if err != nil {
 		return 0, err
@@ -91,5 +91,26 @@ func (d *DAO) CountAll(ctx context.Context) (int, error) {
 	var n int
 	err := d.db.GetContext(ctx, &n,
 		`SELECT COUNT(*) FROM users WHERE deleted_at IS NULL`)
+	return n, err
+}
+
+func (d *DAO) LastRegisterAtByIP(ctx context.Context, ip string) (time.Time, bool, error) {
+	var last sql.NullTime
+	err := d.db.GetContext(ctx, &last,
+		`SELECT MAX(created_at) FROM users WHERE register_ip = ? AND deleted_at IS NULL`, ip)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if !last.Valid {
+		return time.Time{}, false, nil
+	}
+	return last.Time, true, nil
+}
+
+func (d *DAO) CountByRegisterIPSince(ctx context.Context, ip string, since time.Time) (int, error) {
+	var n int
+	err := d.db.GetContext(ctx, &n,
+		`SELECT COUNT(*) FROM users WHERE register_ip = ? AND created_at >= ? AND deleted_at IS NULL`,
+		ip, since)
 	return n, err
 }

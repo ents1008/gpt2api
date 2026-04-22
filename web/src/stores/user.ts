@@ -93,7 +93,7 @@ export const useUserStore = defineStore(
   {
     // 持久化 token 和 user,避免刷新后闪屏
     persist: {
-      key: 'gpt2api.user-store',
+      key: 'jiyun.user-store',
       paths: ['accessToken', 'refreshToken', 'user', 'role', 'permissions'],
     },
   },

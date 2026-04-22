@@ -56,7 +56,7 @@ type RunOptions struct {
 
 // RunResult 是单次生图的输出。
 type RunResult struct {
-	Status         string   // success / failed
+	Status         string // success / failed
 	ConversationID string
 	AccountID      uint64
 	FileIDs        []string // chatgpt.com 侧的原始 ref("sed:" 前缀表示 sediment)
@@ -66,6 +66,18 @@ type RunResult struct {
 	ErrorMessage   string
 	Attempts       int // 跨账号尝试次数(runOnce 次数)
 	DurationMs     int64
+}
+
+func persistTaskWrite(taskID, op string, fn func(context.Context) error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := fn(ctx); err != nil {
+		logger.L().Warn("image task state write failed",
+			zap.String("task_id", taskID),
+			zap.String("op", op),
+			zap.Error(err),
+		)
+	}
 }
 
 // Run 执行生图。会同步阻塞直到完成/失败;调用方自行做超时控制(传 ctx)。
@@ -96,7 +108,9 @@ func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 
 	// 仅当有 DAO 和 taskID 时才落库
 	if r.dao != nil && opt.TaskID != "" {
-		_ = r.dao.MarkRunning(ctx, opt.TaskID, 0)
+		persistTaskWrite(opt.TaskID, "mark_running", func(writeCtx context.Context) error {
+			return r.dao.MarkRunning(writeCtx, opt.TaskID, 0)
+		})
 	}
 
 	for attempt := 1; attempt <= opt.MaxAttempts; attempt++ {
@@ -122,11 +136,18 @@ func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 		}
 		result.ErrorCode = status
 
-		// 仅对"账号级硬错误"做一次跨账号重试:限流 / 无账号 / 鉴权失败。
-		// 其他错误(poll 超时 / 上游 5xx / 网络错)直接抛给用户,不再悄悄吞掉时间。
+		if status == ErrAuthRequired {
+			r.sched.MarkDead(context.Background(), result.AccountID)
+			logger.L().Warn("image runner auth required, mark account dead and retry",
+				zap.String("task_id", opt.TaskID),
+				zap.Int("attempt", attempt),
+				zap.Uint64("account_id", result.AccountID))
+		}
 		if attempt >= opt.MaxAttempts {
 			break
 		}
+		// 仅对账号级硬错误做跨账号重试:限流 / 无账号 / 鉴权失败。
+		// 其他错误(poll 超时 / 上游 5xx / 网络错)直接退出,避免静默吞时间。
 		if status != ErrRateLimited && status != ErrNoAccount && status != ErrAuthRequired {
 			break
 		}
@@ -141,10 +162,14 @@ func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 	// 落库
 	if r.dao != nil && opt.TaskID != "" {
 		if result.Status == StatusSuccess {
-			_ = r.dao.MarkSuccess(ctx, opt.TaskID, result.ConversationID,
-				result.FileIDs, result.SignedURLs, 0 /* credit_cost 由网关负责写 */)
+			persistTaskWrite(opt.TaskID, "mark_success", func(writeCtx context.Context) error {
+				return r.dao.MarkSuccess(writeCtx, opt.TaskID, result.ConversationID,
+					result.FileIDs, result.SignedURLs, 0 /* credit_cost 由网关负责写 */)
+			})
 		} else {
-			_ = r.dao.MarkFailed(ctx, opt.TaskID, result.ErrorCode)
+			persistTaskWrite(opt.TaskID, "mark_failed", func(writeCtx context.Context) error {
+				return r.dao.MarkFailed(writeCtx, opt.TaskID, result.ErrorCode)
+			})
 		}
 	}
 	return result
@@ -168,7 +193,9 @@ func (r *Runner) runOnce(ctx context.Context, opt RunOptions, result *RunResult)
 	// 立刻把 account_id 写回 image_tasks,供后续图片代理端点按 task_id 解出 AT。
 	// MarkRunning 在 status=running 时 WHERE 不命中,所以用专门的 SetAccount。
 	if r.dao != nil && opt.TaskID != "" {
-		_ = r.dao.SetAccount(ctx, opt.TaskID, lease.Account.ID)
+		persistTaskWrite(opt.TaskID, "set_account", func(writeCtx context.Context) error {
+			return r.dao.SetAccount(writeCtx, opt.TaskID, lease.Account.ID)
+		})
 	}
 
 	// 2) 构造上游 client

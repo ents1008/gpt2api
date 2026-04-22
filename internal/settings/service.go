@@ -130,7 +130,7 @@ func (s *Service) GetFloat(key string) float64 {
 // 所有 helper 都保证返回"安全"的业务默认(例如不让 0/负值落到业务路径)。
 
 // -- site --
-func (s *Service) SiteName() string { return firstNonEmpty(s.GetString(SiteName), "GPT2API") }
+func (s *Service) SiteName() string { return firstNonEmpty(s.GetString(SiteName), "积云") }
 
 // -- auth --
 func (s *Service) AllowRegister() bool { return s.GetBool(AuthAllowRegister) }
@@ -155,6 +155,23 @@ func (s *Service) PasswordMinLength() int {
 	}
 	if n > 128 {
 		n = 128
+	}
+	return n
+}
+func (s *Service) RegisterIPCooldownSec() int {
+	n := int(s.GetInt(AuthRegisterIPCooldownSec))
+	if n < 0 {
+		return 0
+	}
+	if n > 86400 {
+		return 86400
+	}
+	return n
+}
+func (s *Service) RegisterIPMaxPer24h() int {
+	n := int(s.GetInt(AuthRegisterIPMaxPer24h))
+	if n < 0 {
+		return 0
 	}
 	return n
 }
@@ -196,14 +213,44 @@ func (s *Service) JWTRefreshTTLSec() int {
 }
 
 // -- key defaults --
-func (s *Service) KeyDefaultDailyQuota() int64 { n := s.GetInt(KeyDefaultDailyQuota); if n < 0 { return 0 }; return n }
-func (s *Service) KeyMaxPerUser() int          { return int(s.GetInt(KeyMaxPerUser)) }
+func (s *Service) KeyDefaultDailyQuota() int64 {
+	n := s.GetInt(KeyDefaultDailyQuota)
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+func (s *Service) KeyMaxPerUser() int { return int(s.GetInt(KeyMaxPerUser)) }
 
 // -- gateway --
-func (s *Service) GatewayUpstreamTimeoutSec() int { n := int(s.GetInt(GatewayUpstreamTimeoutSec)); if n <= 0 { return 60 }; return n }
-func (s *Service) GatewaySSEReadTimeoutSec() int  { n := int(s.GetInt(GatewaySSEReadTimeoutSec));  if n <= 0 { return 120 }; return n }
-func (s *Service) Cooldown429Sec() int            { n := int(s.GetInt(GatewayCooldown429Sec));     if n <= 0 { return 300 }; return n }
-func (s *Service) WarnedPauseHours() int          { n := int(s.GetInt(GatewayWarnedPauseHours));   if n <= 0 { return 24 }; return n }
+func (s *Service) GatewayUpstreamTimeoutSec() int {
+	n := int(s.GetInt(GatewayUpstreamTimeoutSec))
+	if n <= 0 {
+		return 60
+	}
+	return n
+}
+func (s *Service) GatewaySSEReadTimeoutSec() int {
+	n := int(s.GetInt(GatewaySSEReadTimeoutSec))
+	if n <= 0 {
+		return 120
+	}
+	return n
+}
+func (s *Service) Cooldown429Sec() int {
+	n := int(s.GetInt(GatewayCooldown429Sec))
+	if n <= 0 {
+		return 300
+	}
+	return n
+}
+func (s *Service) WarnedPauseHours() int {
+	n := int(s.GetInt(GatewayWarnedPauseHours))
+	if n <= 0 {
+		return 24
+	}
+	return n
+}
 func (s *Service) DailyUsageRatio() float64 {
 	f := s.GetFloat(GatewayDailyUsageRatio)
 	if f <= 0 || f > 1 {
@@ -306,10 +353,28 @@ func (s *Service) AccountDefaultClientID() string {
 }
 
 // -- billing / recharge --
-func (s *Service) RechargeEnabled() bool    { return s.GetBool(RechargeEnabled) }
-func (s *Service) RechargeMinCNY() int64    { n := s.GetInt(RechargeMinCNY); if n < 0 { return 0 }; return n }
-func (s *Service) RechargeMaxCNY() int64    { n := s.GetInt(RechargeMaxCNY); if n < 0 { return 0 }; return n }
-func (s *Service) RechargeDailyLimitCNY() int64 { n := s.GetInt(RechargeDailyLimitCNY); if n < 0 { return 0 }; return n }
+func (s *Service) RechargeEnabled() bool { return s.GetBool(RechargeEnabled) }
+func (s *Service) RechargeMinCNY() int64 {
+	n := s.GetInt(RechargeMinCNY)
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+func (s *Service) RechargeMaxCNY() int64 {
+	n := s.GetInt(RechargeMaxCNY)
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+func (s *Service) RechargeDailyLimitCNY() int64 {
+	n := s.GetInt(RechargeDailyLimitCNY)
+	if n < 0 {
+		return 0
+	}
+	return n
+}
 func (s *Service) RechargeOrderExpireMin() int {
 	n := int(s.GetInt(RechargeOrderExpireMinutes))
 	if n <= 0 {

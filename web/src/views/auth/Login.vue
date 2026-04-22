@@ -11,9 +11,9 @@ const route = useRoute()
 const store = useUserStore()
 const site = useSiteStore()
 
-const siteName = computed(() => site.get('site.name', 'GPT2API'))
+const siteName = computed(() => site.get('site.name', '积云'))
 const siteDesc = computed(() =>
-  site.get('site.description', '基于 chatgpt.com 的 OpenAI 兼容网关 · 多账号池 · IMG2 终稿直出 · 批量出图'),
+  site.get('site.description', '积云统一接口与控制台 · 多账号调度 · 图片生成 · 用量透明'),
 )
 const siteLogo = computed(() => site.get('site.logo_url', ''))
 const siteFooter = computed(() => site.get('site.footer', ''))

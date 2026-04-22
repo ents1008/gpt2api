@@ -5,9 +5,12 @@ import { storeToRefs } from 'pinia'
 import { useUserStore } from '@/stores/user'
 import { formatCredit } from '@/utils/format'
 import {
+  getMyImageTask,
+  listMyImageTasks,
   listMyModels,
   streamPlayChat,
   playGenerateImage,
+  type ImageTask,
   type SimpleModel,
   type PlayChatMessage,
   type PlayImageData,
@@ -313,6 +316,7 @@ const t2iN = ref(1)
 // 进程内 LRU 缓存命中后毫秒级返回。
 type UpscaleLevel = '' | '2k' | '4k'
 const t2iUpscale = ref<UpscaleLevel>('')
+const imageCountOptions = [1, 2, 4, 8]
 
 // 切换比例时,实时把 prompt 第一行同步成新的 "Make the aspect ratio X:Y , "
 watch(t2iRatio, (nv) => {
@@ -335,6 +339,83 @@ function useT2iExample(p: string) {
   t2iPrompt.value = applyRatioPrefix(p, t2iRatio.value)
 }
 
+function isRecoverableImageTimeout(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  return /\b524\b/.test(msg) || /timeout/i.test(msg) || /cloudflare/i.test(msg)
+}
+
+function mapTaskImages(task: ImageTask): PlayImageData[] {
+  return (task.image_urls || []).map((url, idx) => ({
+    url,
+    file_id: task.file_ids?.[idx],
+  }))
+}
+
+function findRecentTask(
+  items: ImageTask[],
+  meta: { prompt: string; size: string; n: number },
+  startedAt: number,
+): ImageTask | null {
+  return items.find((task) => {
+    const createdAt = Date.parse(task.created_at || '')
+    return (
+      task.prompt === meta.prompt &&
+      task.size === meta.size &&
+      task.n === meta.n &&
+      Number.isFinite(createdAt) &&
+      createdAt >= startedAt - 30_000
+    )
+  }) || null
+}
+
+function sleep(ms: number, signal?: AbortSignal) {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms))
+  if (signal.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'))
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve(undefined)
+    }, ms)
+    const onAbort = () => {
+      window.clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+async function recoverImageTask(
+  meta: { prompt: string; size: string; n: number },
+  startedAt: number,
+  signal?: AbortSignal,
+): Promise<PlayImageData[]> {
+  const deadline = Date.now() + 180_000
+  let taskID = ''
+
+  while (Date.now() < deadline) {
+    if (!taskID) {
+      const list = await listMyImageTasks({ limit: 10, offset: 0 })
+      const matched = findRecentTask(list.items || [], meta, startedAt)
+      if (matched) {
+        if (matched.status === 'success') return mapTaskImages(matched)
+        if (matched.status === 'failed') throw new Error(matched.error || '图片生成失败')
+        taskID = matched.task_id
+      }
+    }
+
+    if (taskID) {
+      const task = await getMyImageTask(taskID)
+      if (task.status === 'success') return mapTaskImages(task)
+      if (task.status === 'failed') throw new Error(task.error || '图片生成失败')
+    }
+
+    await sleep(2500, signal)
+  }
+
+  throw new Error('图片任务仍在后台处理中,请稍后在「接口文档 & 用量」查看结果')
+}
+
 async function sendText2Img() {
   const prompt = t2iPrompt.value.trim()
   if (!prompt) {
@@ -349,6 +430,7 @@ async function sendText2Img() {
   t2iError.value = ''
   t2iResult.value = []
   t2iAbort.value = new AbortController()
+  const startedAt = Date.now()
   try {
     const resp = await playGenerateImage(
       {
@@ -367,9 +449,29 @@ async function sendText2Img() {
       ElMessage.success(`生成成功,共 ${t2iResult.value.length} 张`)
     }
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    t2iError.value = msg
-    ElMessage.error(msg)
+    if (isRecoverableImageTimeout(err)) {
+      try {
+        ElMessage.warning('公网等待超时,正在后台继续查询图片任务…')
+        t2iResult.value = await recoverImageTask(
+          { prompt, size: t2iSize.value, n: t2iN.value },
+          startedAt,
+          t2iAbort.value.signal,
+        )
+        if (t2iResult.value.length === 0) {
+          t2iError.value = '任务已找到,但暂未返回图片'
+        } else {
+          ElMessage.success(`生成成功,共 ${t2iResult.value.length} 张`)
+        }
+      } catch (recoverErr: unknown) {
+        const msg = recoverErr instanceof Error ? recoverErr.message : String(recoverErr)
+        t2iError.value = msg
+        ElMessage.error(msg)
+      }
+    } else {
+      const msg = err instanceof Error ? err.message : String(err)
+      t2iError.value = msg
+      ElMessage.error(msg)
+    }
   } finally {
     t2iSending.value = false
     t2iAbort.value = null
@@ -468,6 +570,7 @@ async function sendImg2Img() {
   i2iError.value = ''
   i2iResult.value = []
   i2iAbort.value = new AbortController()
+  const startedAt = Date.now()
   try {
     const resp = await playGenerateImage(
       {
@@ -485,9 +588,29 @@ async function sendImg2Img() {
       ElMessage.success(`生成成功,共 ${i2iResult.value.length} 张`)
     }
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    i2iError.value = msg
-    ElMessage.error(msg)
+    if (isRecoverableImageTimeout(err)) {
+      try {
+        ElMessage.warning('公网等待超时,正在后台继续查询图片任务…')
+        i2iResult.value = await recoverImageTask(
+          { prompt: i2iPrompt.value.trim(), size: i2iSize.value, n: 1 },
+          startedAt,
+          i2iAbort.value.signal,
+        )
+        if (i2iResult.value.length === 0) {
+          i2iError.value = '任务已找到,但暂未返回图片'
+        } else {
+          ElMessage.success(`生成成功,共 ${i2iResult.value.length} 张`)
+        }
+      } catch (recoverErr: unknown) {
+        const msg = recoverErr instanceof Error ? recoverErr.message : String(recoverErr)
+        i2iError.value = msg
+        ElMessage.error(msg)
+      }
+    } else {
+      const msg = err instanceof Error ? err.message : String(err)
+      i2iError.value = msg
+      ElMessage.error(msg)
+    }
   } finally {
     i2iSending.value = false
     i2iAbort.value = null
@@ -760,7 +883,16 @@ watch(activeTab, (v) => {
 
             <div class="side-row">
               <label class="side-lbl">张数 <span class="side-val">{{ t2iN }}</span></label>
-              <el-slider v-model="t2iN" :min="1" :max="4" show-stops />
+              <div class="count-row">
+                <button
+                  v-for="opt in imageCountOptions"
+                  :key="opt"
+                  :class="['count-btn', { active: t2iN === opt }]"
+                  @click="t2iN = opt"
+                >
+                  {{ opt }}
+                </button>
+              </div>
             </div>
 
             <div class="side-row">
@@ -1388,6 +1520,28 @@ watch(activeTab, (v) => {
   border-radius: 4px;
   font-family: ui-monospace, Menlo, Consolas, monospace;
   font-size: 11.5px;
+}
+
+.count-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.count-btn {
+  background: var(--el-bg-color);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  padding: 10px 0;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--el-text-color-secondary);
+  transition: all 0.15s;
+  &:hover {
+    border-color: var(--el-color-primary);
+    color: var(--el-color-primary);
+  }
+  &.active {
+    border-color: var(--el-color-primary);
+    background: var(--el-color-primary-light-9);
+    color: var(--el-color-primary);
+  }
 }
 
 /* prompt chips */

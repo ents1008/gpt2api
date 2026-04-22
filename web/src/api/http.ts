@@ -24,8 +24,8 @@ export const http: AxiosInstance = axios.create({
 })
 
 /** access token 持久化 key(Pinia store 也复用) */
-export const TOKEN_KEY = 'gpt2api.access'
-export const REFRESH_KEY = 'gpt2api.refresh'
+export const TOKEN_KEY = 'jiyun.access'
+export const REFRESH_KEY = 'jiyun.refresh'
 
 http.interceptors.request.use((config) => {
   const token = localStorage.getItem(TOKEN_KEY)

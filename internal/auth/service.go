@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
@@ -16,12 +17,14 @@ import (
 
 // 错误码
 var (
-	ErrEmailExists       = errors.New("auth: email already exists")
-	ErrInvalidCredential = errors.New("auth: invalid email or password")
-	ErrUserBanned        = errors.New("auth: user banned")
-	ErrRegisterDisabled  = errors.New("auth: user registration is disabled")
-	ErrEmailNotAllowed   = errors.New("auth: email domain is not allowed by whitelist")
-	ErrPasswordTooShort  = errors.New("auth: password too short")
+	ErrEmailExists        = errors.New("auth: email already exists")
+	ErrInvalidCredential  = errors.New("auth: invalid email or password")
+	ErrUserBanned         = errors.New("auth: user banned")
+	ErrRegisterDisabled   = errors.New("auth: user registration is disabled")
+	ErrEmailNotAllowed    = errors.New("auth: email domain is not allowed by whitelist")
+	ErrPasswordTooShort   = errors.New("auth: password too short")
+	ErrRegisterIPCooldown = errors.New("auth: register ip cooldown")
+	ErrRegisterIPLimit    = errors.New("auth: register ip limit")
 )
 
 // Service 封装注册、登录、刷新业务。
@@ -60,8 +63,9 @@ func (s *Service) SetSettings(ss *settings.Service) { s.settings = ss }
 func (s *Service) SetBilling(b *billing.Engine) { s.billing = b }
 
 // Register 新用户注册。
-func (s *Service) Register(ctx context.Context, email, password, nickname string) (*user.User, error) {
+func (s *Service) Register(ctx context.Context, email, password, nickname, registerIP string) (*user.User, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
+	registerIP = strings.TrimSpace(registerIP)
 	if email == "" || password == "" {
 		return nil, errors.New("email and password required")
 	}
@@ -104,6 +108,9 @@ func (s *Service) Register(ctx context.Context, email, password, nickname string
 		// 已有用户且管理员关闭了开放注册 —— 拒绝。
 		return nil, ErrRegisterDisabled
 	}
+	if err := s.checkRegisterIPPolicy(ctx, registerIP, time.Now()); err != nil {
+		return nil, err
+	}
 
 	var groupID uint64 = 1
 	if s.settings != nil {
@@ -120,6 +127,7 @@ func (s *Service) Register(ctx context.Context, email, password, nickname string
 		Role:          role,
 		Status:        "active",
 		CreditBalance: 0,
+		RegisterIP:    registerIP,
 	}
 	id, err := s.users.Create(ctx, u)
 	if err != nil {
@@ -140,6 +148,53 @@ func (s *Service) Register(ctx context.Context, email, password, nickname string
 		s.mail.Send(mailer.Message{To: u.Email, Subject: subject, HTML: html})
 	}
 	return u, nil
+}
+
+func (s *Service) checkRegisterIPPolicy(ctx context.Context, ip string, now time.Time) error {
+	if s.settings == nil || strings.TrimSpace(ip) == "" {
+		return nil
+	}
+
+	cooldownSec := s.settings.RegisterIPCooldownSec()
+	maxPer24h := s.settings.RegisterIPMaxPer24h()
+	if cooldownSec <= 0 && maxPer24h <= 0 {
+		return nil
+	}
+
+	var lastAt *time.Time
+	if cooldownSec > 0 {
+		t, ok, err := s.users.LastRegisterAtByIP(ctx, ip)
+		if err != nil {
+			return err
+		}
+		if ok {
+			lastAt = &t
+		}
+	}
+
+	recentCount := 0
+	if maxPer24h > 0 {
+		n, err := s.users.CountByRegisterIPSince(ctx, ip, now.Add(-24*time.Hour))
+		if err != nil {
+			return err
+		}
+		recentCount = n
+	}
+
+	return evaluateRegisterIPPolicy(now, lastAt, recentCount, cooldownSec, maxPer24h)
+}
+
+func evaluateRegisterIPPolicy(now time.Time, lastAt *time.Time, recentCount, cooldownSec, maxPer24h int) error {
+	if cooldownSec > 0 && lastAt != nil {
+		cooldownUntil := lastAt.Add(time.Duration(cooldownSec) * time.Second)
+		if now.Before(cooldownUntil) {
+			return ErrRegisterIPCooldown
+		}
+	}
+	if maxPer24h > 0 && recentCount >= maxPer24h {
+		return ErrRegisterIPLimit
+	}
+	return nil
 }
 
 // Login 校验邮箱密码并签发 token。

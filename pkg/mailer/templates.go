@@ -24,7 +24,7 @@ td.v{color:#222;font-weight:500}
 
 // RenderWelcome 注册欢迎邮件。
 func RenderWelcome(nickname, email, baseURL string) (subject, html string) {
-	subject = "欢迎加入 GPT2API"
+	subject = "欢迎加入积云"
 	if nickname == "" {
 		nickname = email
 	}
@@ -34,7 +34,7 @@ func RenderWelcome(nickname, email, baseURL string) (subject, html string) {
 	html = fmt.Sprintf(`<!doctype html><html><head><meta charset="utf-8">%s</head><body>
 <div class="card">
   <h1>欢迎,%s</h1>
-  <div class="hi">你的 GPT2API 账号已开通,账号 <b>%s</b>。</div>
+  <div class="hi">你的积云账号已开通,账号 <b>%s</b>。</div>
   <div class="box">
     <b>新手指引</b><br/>
     · 到 <b>个人中心 → API Key</b> 创建一把 sk- 开头的 key<br/>

@@ -2,7 +2,6 @@
 import { brandParts } from '@/utils/brand'
 
 const brand = brandParts()
-const brandRepoHref = `https://${brand.repo}`
 const brandQQHref = `https://qm.qq.com/q/${brand.qq}`
 </script>
 
@@ -14,12 +13,6 @@ const brandQQHref = `https://qm.qq.com/q/${brand.qq}`
       <span class="sep">{{ brand.sep }}</span>
       <span>{{ brand.qqLabel }}</span>
       <a :href="brandQQHref" target="_blank" rel="noopener" class="footer-link">{{ brand.qq }}</a>
-      <span class="sep">{{ brand.sep }}</span>
-      <span>{{ brand.repoLabel }}</span>
-      <a :href="brandRepoHref" target="_blank" rel="noopener" class="footer-link">{{ brand.repo }}</a>
-      <span class="sep">{{ brand.sep }}</span>
-      <span>{{ brand.picLabel }}</span>
-      <a :href="brand.picUrl" target="_blank" rel="noopener" class="footer-link pic-link">{{ brand.picText }}</a>
     </div>
   </div>
 </template>
@@ -57,6 +50,5 @@ const brandQQHref = `https://qm.qq.com/q/${brand.qq}`
   text-decoration: none;
   margin: 0 2px;
 }
-.footer-link.pic-link { color: var(--el-color-success, #67c23a); }
 .footer-link:hover { text-decoration: underline; }
 </style>

@@ -44,7 +44,8 @@ node scripts/smoke.mjs \
 ```
 
 - `--keep true` 保留脚本创建的 Key、备份文件(便于后续手动验证)
-- 环境变量 `GPT2API_BASE` 可覆盖 `--base`
+- 环境变量 `JIYUN_BASE` 可覆盖 `--base`
+- 兼容旧变量名（无需额外迁移）
 
 ### 退出码
 
@@ -61,7 +62,7 @@ node scripts/smoke.mjs \
 
 ### 与 CI 配合
 
-GitHub Actions 示例骨架:
+CI 示例骨架:
 
 ```yaml
 - name: docker compose up
@@ -73,4 +74,3 @@ GitHub Actions 示例骨架:
 - name: smoke
   run: node scripts/smoke.mjs --base http://localhost:8080
 ```
-

@@ -90,6 +90,37 @@ type ImageGenResponse struct {
 	TaskID  string         `json:"task_id,omitempty"`
 }
 
+func detachedImageRunContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), timeout)
+}
+
+func updateImageTaskCost(dao *image.DAO, taskID string, cost int64) {
+	if dao == nil || taskID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := dao.UpdateCost(ctx, taskID, cost); err != nil {
+		logger.L().Warn("image task cost write failed",
+			zap.String("task_id", taskID),
+			zap.Int64("cost", cost),
+			zap.Error(err),
+		)
+	}
+}
+
+func normalizeImageCount(n int) (int, error) {
+	if n <= 0 {
+		return 1, nil
+	}
+	switch n {
+	case 1, 2, 4, 8:
+		return n, nil
+	default:
+		return 0, fmt.Errorf("n 仅支持 1、2、4、8")
+	}
+}
+
 // ImageGenerations POST /v1/images/generations。
 func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 	startAt := time.Now()
@@ -111,12 +142,12 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 	if req.Model == "" {
 		req.Model = "gpt-image-2"
 	}
-	if req.N <= 0 {
-		req.N = 1
+	n, err := normalizeImageCount(req.N)
+	if err != nil {
+		openAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
 	}
-	if req.N > 4 {
-		req.N = 4 // 目前 IMG2 终稿单轮稳定产出 1-4 张,保守上限
-	}
+	req.N = n
 	if req.Size == "" {
 		req.Size = "1024x1024"
 	}
@@ -241,9 +272,8 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 
 	// 5) 执行(同步阻塞)
 	//
-	// 单请求硬上限 3 分钟:Runner 默认 per-attempt 2 分钟,留出 1 分钟给
-	// 账号调度 + 签名 URL 换取等周边耗时。IMG2 已正式上线,不再做 preview_only 重试。
-	runCtx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Minute)
+	// 单请求硬上限 6 分钟:单个 attempt 5 分钟 + 可能的 preview_only 重试余量。
+	runCtx, cancel := detachedImageRunContext(6 * time.Minute)
 	defer cancel()
 
 	// 带参考图时,多轮重试没什么意义(反而会重复上传参考图),只留 1 次尝试。
@@ -292,9 +322,7 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 	rec.CreditCost = cost
 
 	// 8) DAO 回写 credit_cost(Runner 已经 MarkSuccess,这里只补 credit_cost)
-	if h.DAO != nil {
-		_ = h.DAO.UpdateCost(c.Request.Context(), taskID, cost)
-	}
+	updateImageTaskCost(h.DAO, taskID, cost)
 
 	// 9) 响应:URL 统一走自家代理,防止 chatgpt.com estuary/content 防盗链
 	out := ImageGenResponse{
@@ -354,14 +382,14 @@ func (h *ImagesHandler) ImageTask(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"task_id":          t.TaskID,
-		"status":           t.Status,
-		"conversation_id":  t.ConversationID,
-		"created":          t.CreatedAt.Unix(),
-		"finished_at":      nullableUnix(t.FinishedAt),
-		"error":            t.Error,
-		"credit_cost":      t.CreditCost,
-		"data":             data,
+		"task_id":         t.TaskID,
+		"status":          t.Status,
+		"conversation_id": t.ConversationID,
+		"created":         t.CreatedAt.Unix(),
+		"finished_at":     nullableUnix(t.FinishedAt),
+		"error":           t.Error,
+		"credit_cost":     t.CreditCost,
+		"data":            data,
 	})
 }
 
@@ -451,7 +479,7 @@ func (h *ImagesHandler) handleChatAsImage(c *gin.Context, rec *usage.Log, ak *ap
 		})
 	}
 
-	runCtx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Minute)
+	runCtx, cancel := detachedImageRunContext(6 * time.Minute)
 	defer cancel()
 
 	res := h.Runner.Run(runCtx, image.RunOptions{
@@ -481,9 +509,7 @@ func (h *ImagesHandler) handleChatAsImage(c *gin.Context, rec *usage.Log, ak *ap
 		_ = h.Billing.Settle(context.Background(), ak.UserID, ak.ID, cost, cost, refID, "chat->image settle")
 	}
 	_ = h.Keys.DAO().TouchUsage(context.Background(), ak.ID, c.ClientIP(), cost)
-	if h.DAO != nil {
-		_ = h.DAO.UpdateCost(c.Request.Context(), taskID, cost)
-	}
+	updateImageTaskCost(h.DAO, taskID, cost)
 
 	rec.Status = usage.StatusSuccess
 	rec.CreditCost = cost
@@ -617,9 +643,17 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 	}
 	n := 1
 	if s := c.Request.FormValue("n"); s != "" {
-		if v, err := parseIntClamp(s, 1, 4); err == nil {
-			n = v
+		v, err := parseIntClamp(s, 1, 8)
+		if err != nil {
+			openAIError(c, http.StatusBadRequest, "invalid_request_error", "n 仅支持 1、2、4、8")
+			return
 		}
+		n0, err := normalizeImageCount(v)
+		if err != nil {
+			openAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		n = n0
 	}
 	size := c.Request.FormValue("size")
 	if size == "" {
@@ -764,7 +798,7 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 		})
 	}
 
-	runCtx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Minute)
+	runCtx, cancel := detachedImageRunContext(8 * time.Minute)
 	defer cancel()
 
 	res := h.Runner.Run(runCtx, image.RunOptions{
@@ -800,9 +834,7 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 
 	rec.Status = usage.StatusSuccess
 	rec.CreditCost = cost
-	if h.DAO != nil {
-		_ = h.DAO.UpdateCost(c.Request.Context(), taskID, cost)
-	}
+	updateImageTaskCost(h.DAO, taskID, cost)
 
 	out := ImageGenResponse{
 		Created: time.Now().Unix(),

@@ -14,13 +14,11 @@ const site = useSiteStore()
 const router = useRouter()
 const route = useRoute()
 
-const siteName = computed(() => site.get('site.name', 'GPT2API'))
+const siteName = computed(() => site.get('site.name', '积云'))
 const siteLogo = computed(() => site.get('site.logo_url', ''))
 const siteFooter = computed(() => site.get('site.footer', ''))
 
-// 版权/广告条(XOR + Base64 混淆,不要直接把明文写在模板里)
 const brand = brandParts()
-const brandRepoHref = `https://${brand.repo}`
 const brandQQHref = `https://qm.qq.com/q/${brand.qq}`
 
 const { menu, user, role, permissions } = storeToRefs(store)
@@ -165,12 +163,6 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
           <span class="sep">{{ brand.sep }}</span>
           <span>{{ brand.qqLabel }}</span>
           <a :href="brandQQHref" target="_blank" rel="noopener" class="footer-link">{{ brand.qq }}</a>
-          <span class="sep">{{ brand.sep }}</span>
-          <span>{{ brand.repoLabel }}</span>
-          <a :href="brandRepoHref" target="_blank" rel="noopener" class="footer-link">{{ brand.repo }}</a>
-          <span class="sep">{{ brand.sep }}</span>
-          <span>{{ brand.picLabel }}</span>
-          <a :href="brand.picUrl" target="_blank" rel="noopener" class="footer-link pic-link">{{ brand.picText }}</a>
         </div>
         <div v-if="siteFooter" class="footer-line footer-custom">{{ siteFooter }}</div>
       </el-footer>

@@ -26,41 +26,43 @@ type KeyDef struct {
 // ---- key 常量 ----
 const (
 	// 通用
-	SiteName         = "site.name"
-	SiteDescription  = "site.description"
-	SiteLogoURL      = "site.logo_url"
-	SiteFooter       = "site.footer"
-	SiteContactEmail = "site.contact_email"
-	SiteDocsURL      = "site.docs_url"
-	SiteAPIBaseURL   = "site.api_base_url"
+	SiteName          = "site.name"
+	SiteDescription   = "site.description"
+	SiteLogoURL       = "site.logo_url"
+	SiteFooter        = "site.footer"
+	SiteContactEmail  = "site.contact_email"
+	SiteDocsURL       = "site.docs_url"
+	SiteAPIBaseURL    = "site.api_base_url"
 	UIDefaultPageSize = "ui.default_page_size"
 
 	// 安全与认证
-	AuthAllowRegister       = "auth.allow_register"
-	AuthRequireEmailVerify  = "auth.require_email_verify"
-	AuthEmailDomainWhitelist = "auth.email_domain_whitelist"
-	AuthPasswordMinLength   = "auth.password_min_length"
-	AuthInviteCodeRequired  = "auth.invite_code_required"
-	Auth2FAEnabled          = "auth.2fa_enabled"
-	AuthJWTAccessTTLSec     = "auth.jwt_access_ttl_sec"
-	AuthJWTRefreshTTLSec    = "auth.jwt_refresh_ttl_sec"
+	AuthAllowRegister         = "auth.allow_register"
+	AuthRequireEmailVerify    = "auth.require_email_verify"
+	AuthEmailDomainWhitelist  = "auth.email_domain_whitelist"
+	AuthPasswordMinLength     = "auth.password_min_length"
+	AuthRegisterIPCooldownSec = "auth.register_ip_cooldown_sec"
+	AuthRegisterIPMaxPer24h   = "auth.register_ip_max_per_24h"
+	AuthInviteCodeRequired    = "auth.invite_code_required"
+	Auth2FAEnabled            = "auth.2fa_enabled"
+	AuthJWTAccessTTLSec       = "auth.jwt_access_ttl_sec"
+	AuthJWTRefreshTTLSec      = "auth.jwt_refresh_ttl_sec"
 
 	// 用户默认值(旧 auth.* 保留兼容)
-	AuthDefaultGroupID       = "auth.default_group_id"
-	AuthSignupBonusCredits   = "auth.signup_bonus_credits"
-	LimitDefaultRPM          = "limit.default_rpm"
-	LimitDefaultTPM          = "limit.default_tpm"
-	KeyDefaultDailyQuota     = "key.default_daily_quota_credits"
-	KeyMaxPerUser            = "key.max_per_user"
+	AuthDefaultGroupID     = "auth.default_group_id"
+	AuthSignupBonusCredits = "auth.signup_bonus_credits"
+	LimitDefaultRPM        = "limit.default_rpm"
+	LimitDefaultTPM        = "limit.default_tpm"
+	KeyDefaultDailyQuota   = "key.default_daily_quota_credits"
+	KeyMaxPerUser          = "key.max_per_user"
 
 	// 网关与调度
-	GatewayUpstreamTimeoutSec = "gateway.upstream_timeout_sec"
-	GatewaySSEReadTimeoutSec  = "gateway.sse_read_timeout_sec"
-	GatewayCooldown429Sec     = "gateway.cooldown_429_sec"
-	GatewayWarnedPauseHours   = "gateway.warned_pause_hours"
-	GatewayDailyUsageRatio    = "gateway.daily_usage_ratio"
-	GatewayRetryOnFailure     = "gateway.retry_on_failure"
-	GatewayRetryMax           = "gateway.retry_max"
+	GatewayUpstreamTimeoutSec   = "gateway.upstream_timeout_sec"
+	GatewaySSEReadTimeoutSec    = "gateway.sse_read_timeout_sec"
+	GatewayCooldown429Sec       = "gateway.cooldown_429_sec"
+	GatewayWarnedPauseHours     = "gateway.warned_pause_hours"
+	GatewayDailyUsageRatio      = "gateway.daily_usage_ratio"
+	GatewayRetryOnFailure       = "gateway.retry_on_failure"
+	GatewayRetryMax             = "gateway.retry_max"
 	GatewayDispatchQueueWaitSec = "gateway.dispatch_queue_wait_sec"
 
 	// 代理管理(健康探测)
@@ -80,13 +82,13 @@ const (
 	AccountDefaultClientID       = "account.default_client_id"
 
 	// 计费与充值
-	BillingCreditPerCNY         = "billing.credit_per_cny"
-	BillingNotifyAdminOnAdjust  = "billing.notify_admin_on_adjust"
-	RechargeEnabled             = "recharge.enabled"
-	RechargeMinCNY              = "recharge.min_cny"
-	RechargeMaxCNY              = "recharge.max_cny"
-	RechargeDailyLimitCNY       = "recharge.daily_limit_cny"
-	RechargeOrderExpireMinutes  = "recharge.order_expire_minutes"
+	BillingCreditPerCNY        = "billing.credit_per_cny"
+	BillingNotifyAdminOnAdjust = "billing.notify_admin_on_adjust"
+	RechargeEnabled            = "recharge.enabled"
+	RechargeMinCNY             = "recharge.min_cny"
+	RechargeMaxCNY             = "recharge.max_cny"
+	RechargeDailyLimitCNY      = "recharge.daily_limit_cny"
+	RechargeOrderExpireMinutes = "recharge.order_expire_minutes"
 
 	// 邮件
 	MailEnabledDisplay = "mail.enabled_display"
@@ -95,8 +97,8 @@ const (
 // Defs 所有合法 key 的 schema。前端编辑页按 category + order 展示。
 var Defs = []KeyDef{
 	// ---------- 通用 ----------
-	{Key: SiteName, Type: "string", Category: "site", Default: "GPT2API", Label: "站点名称", Desc: "展示在顶栏和登录页大标题", Public: true},
-	{Key: SiteDescription, Type: "string", Category: "site", Default: "企业级 OpenAI 兼容网关", Label: "副标题", Desc: "登录页宣传语", Public: true},
+	{Key: SiteName, Type: "string", Category: "site", Default: "积云", Label: "站点名称", Desc: "展示在顶栏和登录页大标题", Public: true},
+	{Key: SiteDescription, Type: "string", Category: "site", Default: "积云统一接口与运营控制台", Label: "副标题", Desc: "登录页宣传语", Public: true},
 	{Key: SiteLogoURL, Type: "url", Category: "site", Default: "", Label: "Logo URL", Desc: "空则使用默认图标", Public: true},
 	{Key: SiteFooter, Type: "string", Category: "site", Default: "", Label: "页脚文案", Desc: "版权/备案号等(纯文本)", Public: true},
 	{Key: SiteContactEmail, Type: "email", Category: "site", Default: "", Label: "联系邮箱", Desc: "对外展示的客服邮箱", Public: true},
@@ -109,6 +111,8 @@ var Defs = []KeyDef{
 	{Key: AuthRequireEmailVerify, Type: "bool", Category: "auth", Default: "false", Label: "邮箱验证", Desc: "注册时必须验证邮箱(预留;尚未实装)"},
 	{Key: AuthEmailDomainWhitelist, Type: "string", Category: "auth", Default: "", Label: "邮箱域名白名单", Desc: "逗号分隔,如 qq.com,gmail.com;留空=不限"},
 	{Key: AuthPasswordMinLength, Type: "int", Category: "auth", Default: "6", Label: "密码最小长度", Desc: "注册/改密时强制校验(6~64)"},
+	{Key: AuthRegisterIPCooldownSec, Type: "int", Category: "auth", Default: "600", Label: "同 IP 注册冷却(秒)", Desc: "0=关闭;同一 IP 在此秒数内不得连续注册"},
+	{Key: AuthRegisterIPMaxPer24h, Type: "int", Category: "auth", Default: "3", Label: "同 IP 24 小时上限", Desc: "0=关闭;同一 IP 24 小时内最多注册次数"},
 	{Key: AuthInviteCodeRequired, Type: "bool", Category: "auth", Default: "false", Label: "邀请码注册", Desc: "必须邀请码才能注册(预留)"},
 	{Key: Auth2FAEnabled, Type: "bool", Category: "auth", Default: "false", Label: "二次验证 2FA", Desc: "允许用户绑定 TOTP(预留)"},
 	{Key: AuthJWTAccessTTLSec, Type: "int", Category: "auth", Default: "7200", Label: "Access Token TTL(秒)", Desc: "默认 7200(2 小时);改后新发 token 生效"},

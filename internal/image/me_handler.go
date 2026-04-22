@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/432539/gpt2api/internal/imageproxy"
 	"github.com/432539/gpt2api/internal/middleware"
 	"github.com/432539/gpt2api/pkg/resp"
 )
@@ -43,10 +44,11 @@ type taskView struct {
 }
 
 func toView(t *Task) taskView {
-	urls := t.DecodeResultURLs()
 	fids := t.DecodeFileIDs()
+	urls := make([]string, 0, len(fids))
 	for i, id := range fids {
 		fids[i] = strings.TrimPrefix(id, "sed:")
+		urls = append(urls, imageproxy.BuildURL(t.TaskID, i, imageproxy.TTL))
 	}
 	return taskView{
 		ID: t.ID, TaskID: t.TaskID, UserID: t.UserID, ModelID: t.ModelID,

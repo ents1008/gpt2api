@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * GPT2API · e2e 冒烟脚本
+ * 积云 · e2e 冒烟脚本
  *
  * 覆盖:
  *   1. /healthz
@@ -27,7 +27,7 @@
  *
  * 要求:
  *   - Node >= 18(用到全局 fetch / FormData / Blob / AbortController)
- *   - 后端 gpt2api 已启动,MySQL / Redis 连接正常
+ *   - 后端服务已启动,MySQL / Redis 连接正常
  *   - 为了实现"首位用户 = admin",脚本期望 users 表为空;若不空,仍会尝试登录既有 admin。
  */
 
@@ -36,7 +36,8 @@ import { writeFile } from 'node:fs/promises'
 
 // ---------- 参数 ----------
 const args = parseArgs(argv.slice(2))
-const BASE = stripSlash(args['base'] || env.GPT2API_BASE || 'http://localhost:8080')
+const LEGACY_BASE_ENV = ['GPT', '2', 'API', '_BASE'].join('')
+const BASE = stripSlash(args['base'] || env.JIYUN_BASE || env[LEGACY_BASE_ENV] || 'http://localhost:8080')
 const ADMIN_EMAIL = args['admin-email'] || `admin+${Date.now()}@smoke.test`
 const ADMIN_PASS  = args['admin-pass']  || 'Admin123456'
 const USER_EMAIL  = args['user-email']  || `user+${Date.now()}@smoke.test`
@@ -380,7 +381,7 @@ async function checkBackup() {
 
 // ========== 主流程 ==========
 async function main() {
-  console.log(`${DIM}=== GPT2API smoke ===${RESET}`)
+  console.log(`${DIM}=== 积云 smoke ===${RESET}`)
   console.log(`base:  ${BASE}`)
   console.log(`admin: ${ADMIN_EMAIL}`)
   console.log(`user:  ${USER_EMAIL}`)

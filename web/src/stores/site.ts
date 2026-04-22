@@ -12,8 +12,8 @@ import { fetchSiteInfo } from '@/api/settings'
  */
 export const useSiteStore = defineStore('site', () => {
   const info = ref<Record<string, string>>({
-    'site.name': 'GPT2API',
-    'site.description': '企业级 OpenAI 兼容网关',
+    'site.name': '积云',
+    'site.description': '积云统一接口与控制台',
     'site.logo_url': '',
     'site.footer': '',
     'site.contact_email': '',
@@ -35,7 +35,7 @@ export const useSiteStore = defineStore('site', () => {
   }
 
   function applyDocumentTitle() {
-    const n = info.value['site.name'] || 'GPT2API'
+    const n = info.value['site.name'] || '积云'
     document.title = `${n} 控制台`
   }
 

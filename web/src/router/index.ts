@@ -103,7 +103,7 @@ const router = createRouter({
 
 router.beforeEach(async (to) => {
   const store = useUserStore()
-  const title = (to.meta.title as string) || 'GPT2API 控制台'
+  const title = (to.meta.title as string) || '积云控制台'
   document.title = title
 
   if (to.meta.public) return true
