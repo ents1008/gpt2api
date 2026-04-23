@@ -152,6 +152,27 @@ func buildPollTimeoutMessage(sse chatgpt.ImageSSEResult, dbg chatgpt.PollDebug, 
 	return strings.Join(parts, "; ")
 }
 
+func classifyPollFailureCode(sse chatgpt.ImageSSEResult, dbg chatgpt.PollDebug, turnstileRequired, freeAccount bool) string {
+	switch {
+	case dbg.AsyncErrorType == "content_policy":
+		return ErrContentPolicyRejected
+	case dbg.AsyncErrorType != "":
+		return ErrImageAsyncError
+	case dbg.ConversationErrors > 0:
+		return ErrConversationPoll
+	case dbg.NewToolMessages > 0:
+		return ErrImageToolNoAsset
+	case turnstileRequired && sse.ImageGenTaskID != "":
+		return ErrTurnstileStalled
+	case freeAccount && sse.ImageGenTaskID != "":
+		return ErrFreeAccountStalled
+	case sse.ImageGenTaskID != "":
+		return ErrImageTaskStalled
+	default:
+		return ErrPollTimeout
+	}
+}
+
 // Run 执行生图。会同步阻塞直到完成/失败;调用方自行做超时控制(传 ctx)。
 func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 	start := time.Now()
@@ -445,10 +466,14 @@ func (r *Runner) runOnce(ctx context.Context, opt RunOptions, result *RunResult)
 			zap.Int("poll_429", dbg.RateLimitHits),
 			zap.Int("poll_tool_messages", dbg.ToolMessages),
 			zap.Int("poll_new_tool_messages", dbg.NewToolMessages),
+			zap.Int("poll_error_messages", dbg.ErrorMessages),
 			zap.String("poll_last_tool_model", dbg.LastToolModelSlug),
 			zap.String("poll_last_tool_recipient", dbg.LastToolRecipient),
 			zap.String("poll_last_tool_author", dbg.LastToolAuthor),
 			zap.String("poll_last_tool_title", dbg.LastToolTitle),
+			zap.String("poll_async_error_type", dbg.AsyncErrorType),
+			zap.String("poll_async_error_message_id", dbg.AsyncErrorMessageID),
+			zap.String("poll_async_error_text", dbg.AsyncErrorText),
 			zap.String("poll_last_error", dbg.LastError),
 		)
 		switch status {
@@ -473,9 +498,15 @@ func (r *Runner) runOnce(ctx context.Context, opt RunOptions, result *RunResult)
 				seen[key] = struct{}{}
 				fileRefs = append(fileRefs, key)
 			}
+		case chatgpt.PollStatusRejected:
+			detail := strings.TrimSpace(dbg.AsyncErrorText)
+			if detail == "" {
+				detail = "upstream image task rejected"
+			}
+			return false, classifyPollFailureCode(sseResult, dbg, cr.Turnstile.Required, cr.IsFreeAccount()), errors.New(detail)
 		case chatgpt.PollStatusTimeout:
 			detail := buildPollTimeoutMessage(sseResult, dbg, cr.Turnstile.Required, cr.IsFreeAccount())
-			return false, ErrPollTimeout, errors.New(detail)
+			return false, classifyPollFailureCode(sseResult, dbg, cr.Turnstile.Required, cr.IsFreeAccount()), errors.New(detail)
 		default:
 			reason := "poll error"
 			if dbg.LastError != "" {

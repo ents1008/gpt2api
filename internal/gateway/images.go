@@ -298,13 +298,7 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 
 	if res.Status != image.StatusSuccess {
 		refund(ifEmpty(res.ErrorCode, "upstream_error"))
-		httpStatus := http.StatusBadGateway
-		if res.ErrorCode == image.ErrNoAccount {
-			httpStatus = http.StatusServiceUnavailable
-		}
-		if res.ErrorCode == image.ErrRateLimited {
-			httpStatus = http.StatusServiceUnavailable
-		}
+		httpStatus := imageErrorHTTPStatus(res.ErrorCode)
 		openAIError(c, httpStatus, ifEmpty(res.ErrorCode, "upstream_error"),
 			localizeImageErr(res.ErrorCode, res.ErrorMessage))
 		return
@@ -497,10 +491,7 @@ func (h *ImagesHandler) handleChatAsImage(c *gin.Context, rec *usage.Log, ak *ap
 
 	if res.Status != image.StatusSuccess {
 		refund(ifEmpty(res.ErrorCode, "upstream_error"))
-		httpStatus := http.StatusBadGateway
-		if res.ErrorCode == image.ErrNoAccount || res.ErrorCode == image.ErrRateLimited {
-			httpStatus = http.StatusServiceUnavailable
-		}
+		httpStatus := imageErrorHTTPStatus(res.ErrorCode)
 		openAIError(c, httpStatus, ifEmpty(res.ErrorCode, "upstream_error"),
 			localizeImageErr(res.ErrorCode, res.ErrorMessage))
 		return
@@ -574,6 +565,20 @@ func localizeImageErr(code, raw string) string {
 		zh = "账号池暂无可用账号,请稍后重试"
 	case image.ErrRateLimited:
 		zh = "上游风控,请稍后再试"
+	case image.ErrContentPolicyRejected:
+		zh = "提示词触发上游内容政策拒绝"
+	case image.ErrImageAsyncError:
+		zh = "上游图片任务返回错误"
+	case image.ErrConversationPoll:
+		zh = "上游会话轮询异常"
+	case image.ErrImageTaskStalled:
+		zh = "上游已接单,但图片任务未继续产出结果"
+	case image.ErrImageToolNoAsset:
+		zh = "上游返回了工具消息,但没有图片资产"
+	case image.ErrTurnstileStalled:
+		zh = "上游要求 Turnstile,图片任务未继续产出结果"
+	case image.ErrFreeAccountStalled:
+		zh = "免费账号链路已接单,但图片任务未继续产出结果"
 	case image.ErrUnknown, "":
 		zh = "图片生成失败"
 	case "upstream_error":
@@ -585,6 +590,17 @@ func localizeImageErr(code, raw string) string {
 		return zh + ":" + raw
 	}
 	return zh
+}
+
+func imageErrorHTTPStatus(code string) int {
+	switch code {
+	case image.ErrNoAccount, image.ErrRateLimited:
+		return http.StatusServiceUnavailable
+	case image.ErrContentPolicyRejected:
+		return http.StatusBadRequest
+	default:
+		return http.StatusBadGateway
+	}
 }
 
 func nullableUnix(t *time.Time) int64 {
@@ -817,10 +833,7 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 
 	if res.Status != image.StatusSuccess {
 		refund(ifEmpty(res.ErrorCode, "upstream_error"))
-		httpStatus := http.StatusBadGateway
-		if res.ErrorCode == image.ErrNoAccount || res.ErrorCode == image.ErrRateLimited {
-			httpStatus = http.StatusServiceUnavailable
-		}
+		httpStatus := imageErrorHTTPStatus(res.ErrorCode)
 		openAIError(c, httpStatus, ifEmpty(res.ErrorCode, "upstream_error"),
 			localizeImageErr(res.ErrorCode, res.ErrorMessage))
 		return

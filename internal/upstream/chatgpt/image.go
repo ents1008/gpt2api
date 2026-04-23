@@ -383,6 +383,19 @@ type ImageToolMsg struct {
 	SedimentIDs   []string // sediment
 }
 
+// ImageErrorMsg 是 conversation.mapping 里一条与 image_gen 相关的 assistant 错误消息。
+type ImageErrorMsg struct {
+	MessageID     string
+	CreateTime    float64
+	Recipient     string
+	AsyncTaskType string
+	AsyncTaskID   string
+	IsError       bool
+	Hidden        bool
+	Text          string
+	ErrorType     string // content_policy / async_error
+}
+
 // GetConversationMapping 读取会话全量 mapping(轮询用)。
 func (c *Client) GetConversationMapping(ctx context.Context, convID string) (map[string]interface{}, error) {
 	if convID == "" {
@@ -490,6 +503,120 @@ func ExtractImageToolMsgs(mapping map[string]interface{}) []ImageToolMsg {
 	return out
 }
 
+// ExtractImageErrorMsgs 提取 image_gen 相关的 assistant 错误消息。
+func ExtractImageErrorMsgs(mapping map[string]interface{}) []ImageErrorMsg {
+	out := make([]ImageErrorMsg, 0, 2)
+	for mid, raw := range mapping {
+		node, _ := raw.(map[string]interface{})
+		if node == nil {
+			continue
+		}
+		msg, _ := node["message"].(map[string]interface{})
+		if msg == nil {
+			continue
+		}
+		author, _ := msg["author"].(map[string]interface{})
+		if author == nil {
+			continue
+		}
+		if s, _ := author["role"].(string); s != "assistant" {
+			continue
+		}
+		content, _ := msg["content"].(map[string]interface{})
+		if content == nil {
+			continue
+		}
+		if s, _ := content["content_type"].(string); s != "text" {
+			continue
+		}
+		meta, _ := msg["metadata"].(map[string]interface{})
+		text := collectTextParts(content["parts"])
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+
+		em := ImageErrorMsg{
+			MessageID: mid,
+			Text:      strings.TrimSpace(text),
+		}
+		if v, ok := msg["create_time"].(float64); ok {
+			em.CreateTime = v
+		}
+		if v, ok := msg["recipient"].(string); ok {
+			em.Recipient = v
+		}
+		if meta != nil {
+			if v, ok := meta["async_task_type"].(string); ok {
+				em.AsyncTaskType = v
+			}
+			if v, ok := meta["async_task_id"].(string); ok {
+				em.AsyncTaskID = v
+			}
+			if v, ok := meta["is_error"].(bool); ok {
+				em.IsError = v
+			}
+			if v, ok := meta["is_visually_hidden_from_conversation"].(bool); ok {
+				em.Hidden = v
+			}
+		}
+		if em.AsyncTaskType != "image_gen" && !em.IsError && !em.Hidden {
+			continue
+		}
+		if isContentPolicyText(em.Text) {
+			em.ErrorType = "content_policy"
+		} else {
+			em.ErrorType = "async_error"
+		}
+		out = append(out, em)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreateTime < out[j].CreateTime })
+	return out
+}
+
+func pickBestImageError(msgs []ImageErrorMsg) *ImageErrorMsg {
+	if len(msgs) == 0 {
+		return nil
+	}
+	for i := range msgs {
+		if msgs[i].AsyncTaskType == "image_gen" && msgs[i].IsError && msgs[i].ErrorType == "content_policy" {
+			return &msgs[i]
+		}
+	}
+	for i := range msgs {
+		if msgs[i].AsyncTaskType == "image_gen" && msgs[i].IsError {
+			return &msgs[i]
+		}
+	}
+	for i := range msgs {
+		if msgs[i].ErrorType == "content_policy" {
+			return &msgs[i]
+		}
+	}
+	return &msgs[len(msgs)-1]
+}
+
+func collectTextParts(raw interface{}) string {
+	parts, _ := raw.([]interface{})
+	var text []string
+	for _, part := range parts {
+		if s, ok := part.(string); ok && strings.TrimSpace(s) != "" {
+			text = append(text, strings.TrimSpace(s))
+		}
+	}
+	return strings.Join(text, "\n")
+}
+
+func isContentPolicyText(text string) bool {
+	s := strings.ToLower(strings.TrimSpace(text))
+	if s == "" {
+		return false
+	}
+	return strings.Contains(s, "内容政策") ||
+		strings.Contains(s, "content policy") ||
+		strings.Contains(s, "safety policy") ||
+		strings.Contains(s, "policy violation")
+}
+
 // PollOpts 控制 PollConversationForImages 的等待策略。
 //
 // IMG2 正式上线后不再做灰度命中判定,逻辑极简化:
@@ -508,23 +635,28 @@ type PollOpts struct {
 type PollStatus string
 
 const (
-	PollStatusSuccess PollStatus = "success" // 至少拿到 1 张图
-	PollStatusTimeout PollStatus = "timeout" // 等到 MaxWait 仍然 0 张
-	PollStatusError   PollStatus = "error"   // 上游错误(429 熔断 / ctx 取消)
+	PollStatusSuccess  PollStatus = "success" // 至少拿到 1 张图
+	PollStatusTimeout  PollStatus = "timeout" // 等到 MaxWait 仍然 0 张
+	PollStatusRejected PollStatus = "rejected"
+	PollStatusError    PollStatus = "error" // 上游错误(429 熔断 / ctx 取消)
 )
 
 // PollDebug 是一次 conversation 轮询的观察结果,用于定位卡在哪一层。
 type PollDebug struct {
-	Attempts           int
-	ConversationErrors int
-	RateLimitHits      int
-	ToolMessages       int
-	NewToolMessages    int
-	LastToolModelSlug  string
-	LastToolRecipient  string
-	LastToolAuthor     string
-	LastToolTitle      string
-	LastError          string
+	Attempts            int
+	ConversationErrors  int
+	RateLimitHits       int
+	ToolMessages        int
+	NewToolMessages     int
+	ErrorMessages       int
+	LastToolModelSlug   string
+	LastToolRecipient   string
+	LastToolAuthor      string
+	LastToolTitle       string
+	AsyncErrorType      string
+	AsyncErrorText      string
+	AsyncErrorMessageID string
+	LastError           string
 }
 
 func normalizePollOpts(opt PollOpts) PollOpts {
@@ -589,6 +721,14 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 
 		msgs := ExtractImageToolMsgs(mapping)
 		dbg.ToolMessages = len(msgs)
+		errMsgs := ExtractImageErrorMsgs(mapping)
+		dbg.ErrorMessages = len(errMsgs)
+		if bestErr := pickBestImageError(errMsgs); bestErr != nil {
+			dbg.AsyncErrorType = bestErr.ErrorType
+			dbg.AsyncErrorText = bestErr.Text
+			dbg.AsyncErrorMessageID = bestErr.MessageID
+			return PollStatusRejected, nil, nil, dbg
+		}
 		// baseline diff:只看本回合新增 tool 消息
 		var newMsgs []ImageToolMsg
 		if len(baseline) > 0 {
