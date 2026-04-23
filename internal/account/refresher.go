@@ -9,12 +9,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/432539/gpt2api/internal/upstream/chatgpt"
 )
 
 // AccountProxyResolver 把账号 ID 映射成代理 URL(形如 http(s)://user:pass@host:port)。
@@ -62,15 +63,24 @@ type Refresher struct {
 }
 
 // NewRefresher 构造。
-// HTTP client 默认直连;如果注入了 AccountProxyResolver,则每次刷新会优先使用
-// 账号绑定的代理,避免从境内直连 auth.openai.com / chatgpt.com 时被劫持。
+// HTTP client 默认直连(uTLS transport + InsecureSkipVerify,兼容 SSL Inspection 代理);
+// 如果注入了 AccountProxyResolver,则每次刷新会优先使用账号绑定的代理。
 func NewRefresher(svc *Service, settings RefreshSettings, logger *zap.Logger) *Refresher {
+	// 直连时也用 uTLS transport,保持与探测/出图一致的 TLS 指纹,
+	// 同时 InsecureSkipVerify=true 兼容 SSL Inspection 代理环境。
+	defaultTr, err := chatgpt.NewUTLSTransport("", 30*time.Second)
+	if err != nil {
+		// 理论上不会失败(空代理 URL);降级到裸 http.Transport
+		defaultTr = http.DefaultTransport
+		logger.Warn("refresher: failed to create uTLS transport, fallback to default", zap.Error(err))
+	}
 	return &Refresher{
 		svc:      svc,
 		settings: settings,
 		log:      logger,
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Transport: defaultTr,
+			Timeout:   30 * time.Second,
 		},
 		kick: make(chan struct{}, 1),
 	}
@@ -82,10 +92,14 @@ func NewRefresher(svc *Service, settings RefreshSettings, logger *zap.Logger) *R
 func (r *Refresher) SetProxyResolver(pr AccountProxyResolver) { r.proxyResolver = pr }
 
 // clientFor 根据账号 ID 选择合适的 http.Client:
-//   - proxyResolver 未注入或返回空 URL → 用默认直连 client
-//   - 返回非空 URL → 构造一次性带代理的 client(结束后 GC)
+//   - proxyResolver 未注入或返回空 URL → 用默认直连 client(uTLS)
+//   - 返回非空 URL → 构造一次性带代理的 uTLS client(结束后 GC)
 //
-// 代理 URL 解析失败时降级到直连,并打 warn 日志。
+// 全部使用 chatgpt.NewUTLSTransport,原因:
+//  1. 伪装 Chrome TLS 指纹,避免 Cloudflare 拦截 auth.openai.com / chatgpt.com 请求;
+//  2. InsecureSkipVerify=true 兼容做 SSL Inspection 的商业代理(证书由代理重签)。
+//
+// 代理 URL 无效时降级到直连 uTLS,并打 warn 日志。
 func (r *Refresher) clientFor(ctx context.Context, accountID uint64) *http.Client {
 	if r.proxyResolver == nil {
 		return r.client
@@ -94,18 +108,11 @@ func (r *Refresher) clientFor(ctx context.Context, accountID uint64) *http.Clien
 	if pu == "" {
 		return r.client
 	}
-	u, err := url.Parse(pu)
+	tr, err := chatgpt.NewUTLSTransport(pu, 30*time.Second)
 	if err != nil {
 		r.log.Warn("invalid proxy url for refresh, fallback direct",
-			zap.Uint64("account_id", accountID), zap.Error(err))
+			zap.Uint64("account_id", accountID), zap.String("proxy", pu), zap.Error(err))
 		return r.client
-	}
-	tr := &http.Transport{
-		Proxy:               http.ProxyURL(u),
-		ForceAttemptHTTP2:   true,
-		MaxIdleConns:        16,
-		IdleConnTimeout:     30 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
 	}
 	return &http.Client{Transport: tr, Timeout: r.client.Timeout}
 }

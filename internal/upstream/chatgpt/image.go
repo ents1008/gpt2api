@@ -396,6 +396,14 @@ type ImageErrorMsg struct {
 	ErrorType     string // content_policy / async_error
 }
 
+// AssistantTextReply 是上游把图片请求当普通聊天处理后的文本回复。
+type AssistantTextReply struct {
+	MessageID  string
+	CreateTime float64
+	Recipient  string
+	Text       string
+}
+
 // GetConversationMapping 读取会话全量 mapping(轮询用)。
 func (c *Client) GetConversationMapping(ctx context.Context, convID string) (map[string]interface{}, error) {
 	if convID == "" {
@@ -573,6 +581,71 @@ func ExtractImageErrorMsgs(mapping map[string]interface{}) []ImageErrorMsg {
 	return out
 }
 
+// ExtractAssistantTextReplies 提取非 image_gen async_error 的普通 assistant 文本回复。
+func ExtractAssistantTextReplies(mapping map[string]interface{}) []AssistantTextReply {
+	out := make([]AssistantTextReply, 0, 2)
+	for mid, raw := range mapping {
+		node, _ := raw.(map[string]interface{})
+		if node == nil {
+			continue
+		}
+		msg, _ := node["message"].(map[string]interface{})
+		if msg == nil {
+			continue
+		}
+		author, _ := msg["author"].(map[string]interface{})
+		if author == nil {
+			continue
+		}
+		if role, _ := author["role"].(string); role != "assistant" {
+			continue
+		}
+		content, _ := msg["content"].(map[string]interface{})
+		if content == nil {
+			continue
+		}
+		if ctype, _ := content["content_type"].(string); ctype != "text" {
+			continue
+		}
+		meta, _ := msg["metadata"].(map[string]interface{})
+		if meta != nil {
+			if taskType, _ := meta["async_task_type"].(string); taskType == "image_gen" {
+				continue
+			}
+			if isErr, _ := meta["is_error"].(bool); isErr {
+				continue
+			}
+			if hidden, _ := meta["is_visually_hidden_from_conversation"].(bool); hidden {
+				continue
+			}
+		}
+		text := strings.TrimSpace(collectTextParts(content["parts"]))
+		if text == "" {
+			continue
+		}
+		reply := AssistantTextReply{
+			MessageID: mid,
+			Text:      text,
+		}
+		if v, ok := msg["create_time"].(float64); ok {
+			reply.CreateTime = v
+		}
+		if v, ok := msg["recipient"].(string); ok {
+			reply.Recipient = v
+		}
+		out = append(out, reply)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreateTime < out[j].CreateTime })
+	return out
+}
+
+func pickBestAssistantTextReply(msgs []AssistantTextReply) *AssistantTextReply {
+	if len(msgs) == 0 {
+		return nil
+	}
+	return &msgs[len(msgs)-1]
+}
+
 func pickBestImageError(msgs []ImageErrorMsg) *ImageErrorMsg {
 	if len(msgs) == 0 {
 		return nil
@@ -643,20 +716,23 @@ const (
 
 // PollDebug 是一次 conversation 轮询的观察结果,用于定位卡在哪一层。
 type PollDebug struct {
-	Attempts            int
-	ConversationErrors  int
-	RateLimitHits       int
-	ToolMessages        int
-	NewToolMessages     int
-	ErrorMessages       int
-	LastToolModelSlug   string
-	LastToolRecipient   string
-	LastToolAuthor      string
-	LastToolTitle       string
-	AsyncErrorType      string
-	AsyncErrorText      string
-	AsyncErrorMessageID string
-	LastError           string
+	Attempts                int
+	ConversationErrors      int
+	RateLimitHits           int
+	ToolMessages            int
+	NewToolMessages         int
+	ErrorMessages           int
+	AssistantReplies        int
+	LastToolModelSlug       string
+	LastToolRecipient       string
+	LastToolAuthor          string
+	LastToolTitle           string
+	AsyncErrorType          string
+	AsyncErrorText          string
+	AsyncErrorMessageID     string
+	AssistantReplyText      string
+	AssistantReplyMessageID string
+	LastError               string
 }
 
 func normalizePollOpts(opt PollOpts) PollOpts {
@@ -728,6 +804,15 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 			dbg.AsyncErrorText = bestErr.Text
 			dbg.AsyncErrorMessageID = bestErr.MessageID
 			return PollStatusRejected, nil, nil, dbg
+		}
+		replyMsgs := ExtractAssistantTextReplies(mapping)
+		dbg.AssistantReplies = len(replyMsgs)
+		if len(msgs) == 0 {
+			if bestReply := pickBestAssistantTextReply(replyMsgs); bestReply != nil {
+				dbg.AssistantReplyText = bestReply.Text
+				dbg.AssistantReplyMessageID = bestReply.MessageID
+				return PollStatusRejected, nil, nil, dbg
+			}
 		}
 		// baseline diff:只看本回合新增 tool 消息
 		var newMsgs []ImageToolMsg

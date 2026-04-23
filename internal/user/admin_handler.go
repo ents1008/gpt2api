@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -49,6 +50,111 @@ func (h *AdminHandler) List(c *gin.Context) {
 		return
 	}
 	resp.OK(c, gin.H{"items": items, "total": total, "limit": limit, "offset": offset})
+}
+
+// createReq POST /api/admin/users 的 body。
+// 密码最短长度在 handler 里强校验 6 位,与自助注册保持一致;
+// 不再走 settings 的 PasswordMinLength(管理员手动建号路径,不关心开放注册开关)。
+type createReq struct {
+	Email          string `json:"email" binding:"required,email"`
+	Password       string `json:"password" binding:"required,min=6"`
+	Nickname       string `json:"nickname"`
+	Role           string `json:"role"`     // user | admin,默认 user
+	Status         string `json:"status"`   // active | banned,默认 active
+	GroupID        uint64 `json:"group_id"` // 默认 1
+	InitialCredits int64  `json:"initial_credits"`
+}
+
+// Create POST /api/admin/users
+// 由管理员直接创建用户,绕过"开放注册"开关和邮箱域名白名单。
+// 当 initial_credits > 0 时会用 billing.AdminAdjust 入账,写 credit_logs。
+func (h *AdminHandler) Create(c *gin.Context) {
+	var req createReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		resp.BadRequest(c, err.Error())
+		return
+	}
+
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	if email == "" {
+		resp.BadRequest(c, "email required")
+		return
+	}
+	role := strings.ToLower(strings.TrimSpace(req.Role))
+	if role == "" {
+		role = "user"
+	}
+	if role != "user" && role != "admin" {
+		resp.BadRequest(c, "role must be user or admin")
+		return
+	}
+	status := strings.ToLower(strings.TrimSpace(req.Status))
+	if status == "" {
+		status = "active"
+	}
+	if status != "active" && status != "banned" {
+		resp.BadRequest(c, "status must be active or banned")
+		return
+	}
+	groupID := req.GroupID
+	if groupID == 0 {
+		groupID = 1
+	}
+
+	ctx := c.Request.Context()
+	if n, err := h.dao.CountByEmail(ctx, email); err != nil {
+		resp.Internal(c, err.Error())
+		return
+	} else if n > 0 {
+		resp.BadRequest(c, "邮箱已存在")
+		return
+	}
+
+	hash, err := h.auth.HashPassword(req.Password)
+	if err != nil {
+		resp.BadRequest(c, err.Error())
+		return
+	}
+
+	u := &User{
+		Email:         email,
+		PasswordHash:  hash,
+		Nickname:      strings.TrimSpace(req.Nickname),
+		GroupID:       groupID,
+		Role:          role,
+		Status:        status,
+		CreditBalance: 0,
+	}
+	id, err := h.dao.Create(ctx, u)
+	if err != nil {
+		resp.Internal(c, err.Error())
+		return
+	}
+	u.ID = id
+
+	// 初始积分(可选):走 billing 正规入账,写 credit_logs。失败不回滚账号(符合
+	// 既有注册赠送的风格),但在审计里单独记一条。
+	if req.InitialCredits > 0 && h.billing != nil {
+		actor := middleware.UserID(c)
+		if _, err := h.billing.AdminAdjust(ctx, id, actor,
+			req.InitialCredits, "admin_create", "created by admin"); err != nil {
+			audit.Record(c, h.auditDAO, "users.create.credit_failed",
+				strconv.FormatUint(id, 10),
+				gin.H{"delta": req.InitialCredits, "error": err.Error()})
+		}
+	}
+
+	audit.Record(c, h.auditDAO, "users.create", strconv.FormatUint(id, 10),
+		gin.H{"email": email, "role": role, "status": status,
+			"group_id": groupID, "initial_credits": req.InitialCredits})
+	resp.OK(c, gin.H{
+		"id":              id,
+		"email":           u.Email,
+		"role":            u.Role,
+		"status":          u.Status,
+		"group_id":        u.GroupID,
+		"initial_credits": req.InitialCredits,
+	})
 }
 
 // Get GET /api/admin/users/:id

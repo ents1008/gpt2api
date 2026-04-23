@@ -8,12 +8,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/432539/gpt2api/internal/upstream/chatgpt"
 )
 
 // QuotaSettings 热更新参数。
@@ -53,6 +54,7 @@ func NewQuotaProber(svc *Service, settings QuotaSettings, logger *zap.Logger) *Q
 		svc:      svc,
 		settings: settings,
 		log:      logger,
+		// client 仅作为"没代理也没 uTLS transport 构造失败"的退路,一般不会走到
 		client: &http.Client{
 			Timeout: 20 * time.Second,
 		},
@@ -63,27 +65,23 @@ func NewQuotaProber(svc *Service, settings QuotaSettings, logger *zap.Logger) *Q
 // SetProxyResolver 注入账号代理解析器;未注入则直连。
 func (q *QuotaProber) SetProxyResolver(pr AccountProxyResolver) { q.proxyResolver = pr }
 
-// clientFor 参见 Refresher.clientFor 的语义。
+// clientFor 返回一个带 uTLS(伪 Chrome ClientHello)的 http.Client。
+//
+// 历史背景:探测额度的落点是 POST /backend-api/conversation/init,这条路径和
+// 生图走的 f/conversation 同一道 Cloudflare 指纹校验。用 Go 默认 net/http 的
+// 标准 TLS 指纹发请求,JA3/JA4 立刻对不上 Chrome,被 403 挡住;而生图之所以
+// 没事是因为它走的是 chatgpt.NewUTLSTransport(内部 parrot 成 Chrome)。
+// 这里统一复用同一套 uTLS transport,保持整个"后台对 chatgpt.com 的触碰"指纹一致。
 func (q *QuotaProber) clientFor(ctx context.Context, accountID uint64) *http.Client {
-	if q.proxyResolver == nil {
-		return q.client
+	proxyURL := ""
+	if q.proxyResolver != nil {
+		proxyURL = q.proxyResolver.ProxyURLForAccount(ctx, accountID)
 	}
-	pu := q.proxyResolver.ProxyURLForAccount(ctx, accountID)
-	if pu == "" {
-		return q.client
-	}
-	u, err := url.Parse(pu)
+	tr, err := chatgpt.NewUTLSTransport(proxyURL, 30*time.Second)
 	if err != nil {
-		q.log.Warn("invalid proxy url for quota probe, fallback direct",
+		q.log.Warn("build utls transport for quota probe failed, fallback std http",
 			zap.Uint64("account_id", accountID), zap.Error(err))
 		return q.client
-	}
-	tr := &http.Transport{
-		Proxy:               http.ProxyURL(u),
-		ForceAttemptHTTP2:   true,
-		MaxIdleConns:        16,
-		IdleConnTimeout:     30 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
 	}
 	return &http.Client{Transport: tr, Timeout: q.client.Timeout}
 }
@@ -175,7 +173,7 @@ func (q *QuotaProber) ProbeOne(ctx context.Context, a *Account) (*QuotaResult, e
 		return res, errors.New(res.Error)
 	}
 
-	probe, probeErr := q.doProbe(ctx, a.ID, at)
+	probe, probeErr := q.doProbe(ctx, a, at)
 	if probeErr != nil {
 		res.Error = friendlyProbeErr(probeErr)
 		_ = q.svc.dao.ApplyQuotaResult(ctx, a.ID, -1, -1, nil)
@@ -216,7 +214,14 @@ type probeOutcome struct {
 //   - limits_progress[].feature_name == "image_gen" → remaining / reset_after
 //   - default_model_slug  → 账号默认模型
 //   - blocked_features    → 被风控限制的功能;非空需要关注
-func (q *QuotaProber) doProbe(ctx context.Context, accountID uint64, accessToken string) (out probeOutcome, err error) {
+//
+// 指纹注意事项(曾在这里踩过 403):
+//   - TLS ClientHello 必须是 Chrome parrot(uTLS),由 q.clientFor 返回的 transport 提供;
+//   - HTTP 头部必须对齐 chatgpt.Client.commonHeaders(全套 sec-ch-ua-* / sec-fetch-*
+//     / Oai-Device-Id / Oai-Client-Version),少任何一项都可能被 Cloudflare / 业务风控
+//     当成脚本直接 403;
+//   - User-Agent / sec-ch-ua 两者的版本号必须一致(都是 Edge 143),否则"指纹冲突"。
+func (q *QuotaProber) doProbe(ctx context.Context, a *Account, accessToken string) (out probeOutcome, err error) {
 	out.remaining = -1
 	out.total = -1
 
@@ -228,15 +233,57 @@ func (q *QuotaProber) doProbe(ctx context.Context, accountID uint64, accessToken
 	if err != nil {
 		return
 	}
+
+	// ── 基础头 ──
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Referer", "https://chatgpt.com/")
-	req.Header.Set("Origin", "https://chatgpt.com")
-	req.Header.Set("User-Agent",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	req.Header.Set("Origin", chatgpt.BaseURL)
+	req.Header.Set("Referer", chatgpt.BaseURL+"/")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6")
+	req.Header.Set("User-Agent", chatgpt.DefaultUserAgent)
 
-	resp, e := q.clientFor(ctx, accountID).Do(req)
+	// ── Client-Hints(Edge 143 @ Windows 11,必须跟 UA 版本一致)──
+	req.Header.Set("Sec-Ch-Ua", `"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"`)
+	req.Header.Set("Sec-Ch-Ua-Arch", `"x86"`)
+	req.Header.Set("Sec-Ch-Ua-Bitness", `"64"`)
+	req.Header.Set("Sec-Ch-Ua-Full-Version", `"143.0.3650.96"`)
+	req.Header.Set("Sec-Ch-Ua-Full-Version-List",
+		`"Microsoft Edge";v="143.0.3650.96", "Chromium";v="143.0.7499.147", "Not A(Brand";v="24.0.0.0"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Model", `""`)
+	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
+	req.Header.Set("Sec-Ch-Ua-Platform-Version", `"19.0.0"`)
+
+	// ── Fetch 元数据(同源 XHR)──
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("Priority", "u=1, i")
+
+	// ── Oai-* 业务指纹(chatgpt.com 自己埋的)──
+	// DeviceID 缺失会触发降权/频繁 403,这里用账号绑定的;实在没存就退回随机填充,
+	// 起码让请求长得像浏览器。
+	deviceID := strings.TrimSpace(a.OAIDeviceID)
+	if deviceID == "" {
+		deviceID = fallbackDeviceID(a.ID)
+	}
+	req.Header.Set("Oai-Device-Id", deviceID)
+	if sid := strings.TrimSpace(a.OAISessionID); sid != "" {
+		req.Header.Set("Oai-Session-Id", sid)
+	}
+	req.Header.Set("Oai-Language", chatgpt.DefaultLanguage)
+	req.Header.Set("Oai-Client-Version", chatgpt.DefaultClientVersion)
+	req.Header.Set("Oai-Client-Build-Number", chatgpt.DefaultClientBuildNum)
+
+	// ── X-Openai-Target-* (chatgpt web 每请求必带,值就是 URL path)──
+	req.Header.Set("X-Openai-Target-Path", req.URL.Path)
+	req.Header.Set("X-Openai-Target-Route", req.URL.Path)
+
+	resp, e := q.clientFor(ctx, a.ID).Do(req)
 	if e != nil {
 		err = e
 		return
@@ -282,6 +329,15 @@ func (q *QuotaProber) doProbe(ctx context.Context, accountID uint64, accessToken
 		}
 	}
 	return
+}
+
+// fallbackDeviceID 兜底 Oai-Device-Id:用账号 ID 拼一个固定的 uuid-like 字符串,
+// 保证同一账号每次探测都发一样的 device-id(这跟"用户在浏览器里的固定 LocalStorage"
+// 语义一致),避免被风控标成"跳跃式设备"。生产环境建议在首次登录时就把真实
+// device-id 写进 oai_accounts.oai_device_id。
+func fallbackDeviceID(accountID uint64) string {
+	// 形如 00000000-0000-4000-8000-xxxxxxxxxxxx(变体位正确,RFC 4122 v4)
+	return fmt.Sprintf("00000000-0000-4000-8000-%012d", accountID%1_000_000_000_000)
 }
 
 func isImageFeature(name string) bool {

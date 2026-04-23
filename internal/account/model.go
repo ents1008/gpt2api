@@ -57,6 +57,12 @@ type Account struct {
 	UpdatedAt time.Time    `db:"updated_at" json:"updated_at"`
 	DeletedAt sql.NullTime `db:"deleted_at" json:"-"`
 
+	// ActiveEmail 是 MySQL STORED 生成列:活行=email / 软删行=NULL。
+	// 仅用于绑定 uk_active_email 这个"软删感知"的唯一索引,业务代码不会直接使用。
+	// 必须声明在 struct 里,否则 sqlx 严格模式下 SELECT * 会报
+	// "missing destination name active_email"。
+	ActiveEmail sql.NullString `db:"active_email" json:"-"`
+
 	// 辅助字段(非数据库列):前端展示用标志位。
 	HasRT bool `db:"-" json:"has_rt"`
 	HasST bool `db:"-" json:"has_st"`

@@ -95,6 +95,13 @@ func TestClassifyPollFailureCode(t *testing.T) {
 			want: ErrImageAsyncError,
 		},
 		{
+			name: "plain assistant text reply gets dedicated code",
+			dbg: chatgpt.PollDebug{
+				AssistantReplyText: "I can't create that image.",
+			},
+			want: ErrAssistantReply,
+		},
+		{
 			name: "conversation poll error wins",
 			dbg: chatgpt.PollDebug{
 				ConversationErrors: 2,

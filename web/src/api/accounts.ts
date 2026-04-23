@@ -45,6 +45,16 @@ export function listAccounts(params: {
   return http.get<any, Page<Account>>('/api/admin/accounts', { params })
 }
 
+export interface QuotaSummary {
+  total_remaining: number
+  total_capacity: number
+  active_accounts: number
+}
+
+export function getQuotaSummary() {
+  return http.get<any, QuotaSummary>('/api/admin/accounts/quota-summary')
+}
+
 export function getAccount(id: number) {
   return http.get<any, Account>(`/api/admin/accounts/${id}`)
 }

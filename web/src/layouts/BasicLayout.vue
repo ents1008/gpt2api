@@ -6,6 +6,7 @@ import { useUserStore } from '@/stores/user'
 import { useUIStore } from '@/stores/ui'
 import { useSiteStore } from '@/stores/site'
 import { brandParts } from '@/utils/brand'
+import { APP_VERSION } from '@/version'
 import type { MenuItem } from '@/api/auth'
 
 const store = useUserStore()
@@ -105,6 +106,11 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
           </el-sub-menu>
         </template>
       </el-menu>
+
+      <!-- 版本号 -->
+      <div class="sidebar-version" :class="{ collapsed }">
+        <span class="ver-text">{{ collapsed ? APP_VERSION.replace('v','') : APP_VERSION }}</span>
+      </div>
     </el-aside>
 
     <el-container>
@@ -177,6 +183,13 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
   background: var(--gp-sidebar-bg);
   transition: width .2s;
   overflow-x: hidden;
+  display: flex !important;
+  flex-direction: column;
+  .side-menu {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
 }
 
 .logo {
@@ -204,7 +217,7 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
 }
 
 .side-menu {
-  border-right: none;
+  border-right: none !important;
   --el-menu-hover-bg-color: rgba(255,255,255,0.06);
 }
 
@@ -279,4 +292,25 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
 
 .fade-enter-active, .fade-leave-active { transition: opacity .15s; }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
+
+.sidebar-version {
+  position: sticky;
+  bottom: 0;
+  padding: 10px 16px;
+  text-align: center;
+  border-top: 1px solid rgba(255,255,255,0.07);
+  background: var(--gp-sidebar-bg);
+  .ver-text {
+    display: inline-block;
+    font-size: 11px;
+    color: rgba(255,255,255,0.28);
+    letter-spacing: 0.5px;
+    user-select: none;
+    white-space: nowrap;
+  }
+  &.collapsed .ver-text {
+    font-size: 9px;
+    letter-spacing: 0;
+  }
+}
 </style>

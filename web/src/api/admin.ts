@@ -32,6 +32,20 @@ export function getUser(id: number): Promise<AdminUser> {
   return http.get(`/api/admin/users/${id}`)
 }
 
+export interface CreateUserReq {
+  email: string
+  password: string
+  nickname?: string
+  role?: 'user' | 'admin'
+  status?: 'active' | 'banned'
+  group_id?: number
+  initial_credits?: number
+}
+
+export function createUser(body: CreateUserReq) {
+  return http.post('/api/admin/users', body)
+}
+
 export function patchUser(id: number, body: Partial<Pick<AdminUser, 'nickname' | 'role' | 'status' | 'group_id'>>) {
   return http.patch(`/api/admin/users/${id}`, body)
 }

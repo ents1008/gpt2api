@@ -25,6 +25,10 @@
  *
  * 或直接 `npm run smoke` (在 web/package.json 也注册了)。
  *
+ * ⚠️ 上面的 admin@smoke.test / Admin123456 / user@smoke.test / User123456
+ *    只是本脚本自己要创建的"测试账号"的默认参数,**不是** GPT2API 部署后的默认凭证。
+ *    正式部署没有任何内置账号,首位注册者自动成为 admin(见根 README.md)。
+ *
  * 要求:
  *   - Node >= 18(用到全局 fetch / FormData / Blob / AbortController)
  *   - 后端服务已启动,MySQL / Redis 连接正常

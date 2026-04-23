@@ -390,6 +390,7 @@ async function onRefreshAll() {
       duration: 4000,
     })
     fetchList()
+    loadQuotaSummary()
   } catch (e: any) {
     ElMessage.error(e?.message || '刷新失败')
   } finally {
@@ -413,6 +414,7 @@ async function onProbeAll() {
       duration: 4000,
     })
     fetchList()
+    loadQuotaSummary()
   } catch (e: any) {
     ElMessage.error(e?.message || '探测失败')
   } finally {
@@ -683,10 +685,19 @@ function cloneAgg(): accountApi.ImportSummary {
   }
 }
 
+// ========== 额度汇总 ==========
+const quotaSummary = ref<accountApi.QuotaSummary | null>(null)
+async function loadQuotaSummary() {
+  try {
+    quotaSummary.value = await accountApi.getQuotaSummary()
+  } catch { /* noop */ }
+}
+
 onMounted(() => {
   fetchList()
   fetchProxies()
   loadAutoRefresh()
+  loadQuotaSummary()
 })
 </script>
 
@@ -696,7 +707,15 @@ onMounted(() => {
     <div class="card-block hdr">
       <div class="flex-between">
         <div class="hdr-left">
-          <h2 class="page-title">GPT 账号池</h2>
+          <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">
+            <h2 class="page-title" style="margin:0">GPT 账号池</h2>
+            <el-tag v-if="quotaSummary" type="success" size="small" style="font-size:13px">
+              当前剩余总额度&nbsp;<b>{{ quotaSummary.total_remaining }}</b>
+              &nbsp;/&nbsp;{{ quotaSummary.total_capacity }}
+              &nbsp;（{{ quotaSummary.active_accounts }} 个账号）
+            </el-tag>
+            <el-tag v-else type="info" size="small">额度统计加载中…</el-tag>
+          </div>
           <div class="page-sub">
             统一管理 ChatGPT Plus / Team / Codex 账号:JSON / AT / RT / ST 批量导入 · 自动刷新 · 图片额度探测 · 风控熔断轮转
           </div>

@@ -569,6 +569,8 @@ func localizeImageErr(code, raw string) string {
 		zh = "提示词触发上游内容政策拒绝"
 	case image.ErrImageAsyncError:
 		zh = "上游图片任务返回错误"
+	case image.ErrAssistantReply:
+		zh = "上游没有进入图片生成,返回了文本回复"
 	case image.ErrConversationPoll:
 		zh = "上游会话轮询异常"
 	case image.ErrImageTaskStalled:
@@ -596,7 +598,7 @@ func imageErrorHTTPStatus(code string) int {
 	switch code {
 	case image.ErrNoAccount, image.ErrRateLimited:
 		return http.StatusServiceUnavailable
-	case image.ErrContentPolicyRejected:
+	case image.ErrContentPolicyRejected, image.ErrImageAsyncError, image.ErrAssistantReply:
 		return http.StatusBadRequest
 	default:
 		return http.StatusBadGateway

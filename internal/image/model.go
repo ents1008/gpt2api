@@ -29,6 +29,7 @@ const (
 	ErrNoAccount             = "no_available_account"
 	ErrAuthRequired          = "auth_required"
 	ErrRateLimited           = "rate_limited"
+	ErrNetworkTransient      = "network_transient" // 瞬态网络错误(EOF / reset),可自动重试
 	ErrPOWTimeout            = "pow_timeout"
 	ErrPOWFailed             = "pow_failed"
 	ErrTurnstile             = "turnstile_required"
@@ -36,6 +37,7 @@ const (
 	ErrPollTimeout           = "poll_timeout"
 	ErrContentPolicyRejected = "content_policy_rejected"
 	ErrImageAsyncError       = "image_async_error"
+	ErrAssistantReply        = "image_assistant_reply"
 	ErrConversationPoll      = "conversation_poll_error"
 	ErrImageTaskStalled      = "image_task_stalled"
 	ErrImageToolNoAsset      = "image_tool_without_asset"
@@ -47,26 +49,26 @@ const (
 
 // Task 对应 image_tasks 表。
 type Task struct {
-	ID              uint64     `db:"id"`
-	TaskID          string     `db:"task_id"` // 对外 id:img_xxx
-	UserID          uint64     `db:"user_id"`
-	KeyID           uint64     `db:"key_id"`
-	ModelID         uint64     `db:"model_id"`
-	AccountID       uint64     `db:"account_id"`
-	Prompt          string     `db:"prompt"`
-	N               int        `db:"n"`
-	Size            string     `db:"size"`
-	Upscale         string     `db:"upscale"` // '' | '2k' | '4k',ImageProxy 读取后对原图做 Catmull-Rom 放大
-	Status          string     `db:"status"`
-	ConversationID  string     `db:"conversation_id"`
-	FileIDs         []byte     `db:"file_ids"`    // JSON 数组字符串
-	ResultURLs      []byte     `db:"result_urls"` // JSON 数组字符串(签名 URL)
-	Error           string     `db:"error"`
-	EstimatedCredit int64      `db:"estimated_credit"`
-	CreditCost      int64      `db:"credit_cost"`
-	CreatedAt       time.Time  `db:"created_at"`
-	StartedAt       *time.Time `db:"started_at"`
-	FinishedAt      *time.Time `db:"finished_at"`
+	ID              uint64     `db:"id"               json:"id"`
+	TaskID          string     `db:"task_id"          json:"task_id"`
+	UserID          uint64     `db:"user_id"          json:"user_id"`
+	KeyID           uint64     `db:"key_id"           json:"key_id"`
+	ModelID         uint64     `db:"model_id"         json:"model_id"`
+	AccountID       uint64     `db:"account_id"       json:"account_id"`
+	Prompt          string     `db:"prompt"           json:"prompt"`
+	N               int        `db:"n"                json:"n"`
+	Size            string     `db:"size"             json:"size"`
+	Upscale         string     `db:"upscale"          json:"upscale"`
+	Status          string     `db:"status"           json:"status"`
+	ConversationID  string     `db:"conversation_id"  json:"conversation_id"`
+	FileIDs         []byte     `db:"file_ids"         json:"-"`
+	ResultURLs      []byte     `db:"result_urls"      json:"-"`
+	Error           string     `db:"error"            json:"error"`
+	EstimatedCredit int64      `db:"estimated_credit" json:"estimated_credit"`
+	CreditCost      int64      `db:"credit_cost"      json:"credit_cost"`
+	CreatedAt       time.Time  `db:"created_at"       json:"created_at"`
+	StartedAt       *time.Time `db:"started_at"       json:"started_at"`
+	FinishedAt      *time.Time `db:"finished_at"      json:"finished_at"`
 }
 
 // Result 是 Runner 返回给网关/客户端的生图结果。

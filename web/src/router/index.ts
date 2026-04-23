@@ -76,6 +76,8 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '用量统计', perm: 'usage:read_all' } },
       { path: 'keys', component: () => import('@/views/admin/AdminKeys.vue'),
         meta: { title: '全局 Keys', perm: 'key:read_all' } },
+      { path: 'image-tasks', component: () => import('@/views/admin/ImageTasks.vue'),
+        meta: { title: '生成记录', perm: 'usage:read_all' } },
       { path: 'audit', component: () => import('@/views/admin/Audit.vue'),
         meta: { title: '审计日志', perm: 'audit:read' } },
       { path: 'backup', component: () => import('@/views/admin/Backup.vue'),

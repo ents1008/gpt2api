@@ -78,3 +78,38 @@ func TestExtractImageErrorMsgsDetectsContentPolicyAsyncError(t *testing.T) {
 		t.Fatalf("best.Text = %q, want content policy refusal text", best.Text)
 	}
 }
+
+func TestExtractAssistantTextRepliesDetectsPlainAssistantRefusal(t *testing.T) {
+	mapping := map[string]interface{}{
+		"assistant_reply": map[string]interface{}{
+			"message": map[string]interface{}{
+				"author": map[string]interface{}{"role": "assistant"},
+				"content": map[string]interface{}{
+					"content_type": "text",
+					"parts":        []interface{}{"I can't create that image. If you have another request, let me know!"},
+				},
+				"status":    "finished_successfully",
+				"recipient": "all",
+				"metadata":  map[string]interface{}{},
+			},
+		},
+		"context": map[string]interface{}{
+			"message": map[string]interface{}{
+				"author": map[string]interface{}{"role": "assistant"},
+				"content": map[string]interface{}{
+					"content_type": "model_editable_context",
+				},
+				"status":   "finished_successfully",
+				"metadata": map[string]interface{}{},
+			},
+		},
+	}
+
+	msgs := ExtractAssistantTextReplies(mapping)
+	if len(msgs) != 1 {
+		t.Fatalf("len(ExtractAssistantTextReplies) = %d, want 1", len(msgs))
+	}
+	if !strings.Contains(msgs[0].Text, "can't create") {
+		t.Fatalf("assistant reply text = %q, want refusal text", msgs[0].Text)
+	}
+}

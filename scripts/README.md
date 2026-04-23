@@ -2,6 +2,12 @@
 
 运维/自测辅助脚本集合。
 
+> **⚠️ 注意** 本目录下所有 `--admin-email` / `--admin-pass` / `--user-email` / `--user-pass` 以及
+> 形如 `admin@smoke.test`、`Admin123456`、`User123456` 这样的字面量,都是**冒烟脚本自己创建测试账号时用的临时凭证**,
+> 它们 **不是** 部署后的默认管理员账号密码。
+>
+> GPT2API 本身不内置任何默认账号 —— **首位访问 `/register` 的用户自动成为 admin**(见根目录 README.md 的部署说明)。
+
 ## smoke.mjs · e2e 冒烟
 
 对已启动的后端(本地 `go run` 或 `docker compose up -d`)做一轮端到端闭环自检。

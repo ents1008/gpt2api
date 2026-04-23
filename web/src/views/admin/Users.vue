@@ -50,6 +50,47 @@ function resetFilter() {
   fetchList()
 }
 
+// ---- 添加用户 ----
+const createDlg = ref(false)
+const createForm = reactive({
+  email: '',
+  password: '',
+  nickname: '',
+  role: 'user' as 'user' | 'admin',
+  status: 'active' as 'active' | 'banned',
+  group_id: 1,
+  initial_credits: 0,
+})
+function openCreate() {
+  createForm.email = ''
+  createForm.password = ''
+  createForm.nickname = ''
+  createForm.role = 'user'
+  createForm.status = 'active'
+  createForm.group_id = groups.value[0]?.id || 1
+  createForm.initial_credits = 0
+  createDlg.value = true
+}
+async function onCreateSubmit() {
+  const email = createForm.email.trim()
+  if (!email) return ElMessage.warning('请输入邮箱')
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return ElMessage.warning('邮箱格式不正确')
+  if (createForm.password.length < 6) return ElMessage.warning('密码至少 6 位')
+  await adminApi.createUser({
+    email,
+    password: createForm.password,
+    nickname: createForm.nickname.trim(),
+    role: createForm.role,
+    status: createForm.status,
+    group_id: createForm.group_id,
+    initial_credits: createForm.initial_credits > 0 ? createForm.initial_credits : undefined,
+  })
+  ElMessage.success('用户创建成功')
+  createDlg.value = false
+  filter.offset = 0
+  fetchList()
+}
+
 // ---- 编辑 ----
 const editDlg = ref(false)
 const editingRow = ref<adminApi.AdminUser | null>(null)
@@ -177,6 +218,9 @@ onMounted(() => { fetchGroups(); fetchList() })
         </el-select>
         <el-button type="primary" @click="fetchList"><el-icon><Search /></el-icon> 查询</el-button>
         <el-button @click="resetFilter">重置</el-button>
+        <el-button type="success" @click="openCreate" :disabled="!canEdit">
+          <el-icon><Plus /></el-icon> 添加用户
+        </el-button>
       </el-form>
 
       <el-table v-loading="loading" :data="rows" stripe style="margin-top:12px">
@@ -238,6 +282,50 @@ onMounted(() => { fetchGroups(); fetchList() })
         layout="total, sizes, prev, pager, next"
       />
     </div>
+
+    <!-- 添加用户 -->
+    <el-dialog v-model="createDlg" title="添加用户" width="500px">
+      <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px"
+                title="此入口由管理员直接建号,不受『开放注册开关』和『邮箱域名白名单』限制;新账号立即可用。" />
+      <el-form :model="createForm" label-width="100px">
+        <el-form-item label="邮箱" required>
+          <el-input v-model="createForm.email" placeholder="user@example.com" clearable />
+        </el-form-item>
+        <el-form-item label="初始密码" required>
+          <el-input v-model="createForm.password" type="password" show-password placeholder="≥ 6 位,可让用户首次登录后自行修改" />
+        </el-form-item>
+        <el-form-item label="昵称">
+          <el-input v-model="createForm.nickname" maxlength="40" show-word-limit />
+        </el-form-item>
+        <el-form-item label="角色">
+          <el-select v-model="createForm.role" style="width:100%">
+            <el-option label="普通用户" value="user" />
+            <el-option label="管理员" value="admin" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="状态">
+          <el-select v-model="createForm.status" style="width:100%">
+            <el-option label="正常" value="active" />
+            <el-option label="封禁" value="banned" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="分组">
+          <el-select v-model="createForm.group_id" style="width:100%">
+            <el-option v-for="g in groups" :key="g.id" :label="g.name" :value="g.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="初始积分">
+          <el-input-number v-model="createForm.initial_credits" :min="0" :step="10000" style="width:100%" />
+          <div style="font-size:12px;color:var(--el-text-color-secondary);margin-top:4px">
+            单位:厘(1 积分 = 10000 厘)。>0 时会走正规入账,写 credit_logs。
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="createDlg = false">取消</el-button>
+        <el-button type="primary" @click="onCreateSubmit">创建</el-button>
+      </template>
+    </el-dialog>
 
     <!-- 编辑 -->
     <el-dialog v-model="editDlg" title="编辑用户" width="480px">

@@ -128,6 +128,64 @@ SELECT id, task_id, user_id, key_id, model_id, account_id, prompt, n, size, upsc
 	return out, err
 }
 
+// AdminTaskRow 是管理员视角的生成记录行,JOIN 了 users 表的邮箱。
+type AdminTaskRow struct {
+	Task
+	UserEmail string `db:"user_email" json:"user_email"`
+}
+
+// AdminTaskFilter 管理员查询过滤条件。
+type AdminTaskFilter struct {
+	UserID  uint64
+	Keyword string // 模糊匹配 prompt / email
+	Status  string
+}
+
+// ListAdmin 全局分页(admin)。
+func (d *DAO) ListAdmin(ctx context.Context, f AdminTaskFilter, limit, offset int) ([]AdminTaskRow, int64, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	where := "1=1"
+	args := []interface{}{}
+	if f.UserID > 0 {
+		where += " AND t.user_id = ?"
+		args = append(args, f.UserID)
+	}
+	if f.Status != "" {
+		where += " AND t.status = ?"
+		args = append(args, f.Status)
+	}
+	if f.Keyword != "" {
+		like := "%" + f.Keyword + "%"
+		where += " AND (t.prompt LIKE ? OR u.email LIKE ?)"
+		args = append(args, like, like)
+	}
+
+	var total int64
+	countSQL := `SELECT COUNT(*) FROM image_tasks t LEFT JOIN users u ON u.id=t.user_id WHERE ` + where
+	if err := d.db.GetContext(ctx, &total, countSQL, args...); err != nil {
+		return nil, 0, err
+	}
+
+	listSQL := `
+SELECT t.id, t.task_id, t.user_id, t.key_id, t.model_id, t.account_id,
+       t.prompt, t.n, t.size, t.upscale, t.status,
+       t.conversation_id, t.file_ids, t.result_urls, t.error,
+       t.estimated_credit, t.credit_cost,
+       t.created_at, t.started_at, t.finished_at,
+       COALESCE(u.email, '') AS user_email
+  FROM image_tasks t
+  LEFT JOIN users u ON u.id = t.user_id
+ WHERE ` + where + `
+ ORDER BY t.id DESC
+ LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
+	var out []AdminTaskRow
+	err := d.db.SelectContext(ctx, &out, listSQL, args...)
+	return out, total, err
+}
+
 // DecodeFileIDs 把 JSON 列解出字符串数组。
 func (t *Task) DecodeFileIDs() []string {
 	var out []string
