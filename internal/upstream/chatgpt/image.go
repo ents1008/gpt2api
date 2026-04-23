@@ -513,6 +513,20 @@ const (
 	PollStatusError   PollStatus = "error"   // 上游错误(429 熔断 / ctx 取消)
 )
 
+// PollDebug 是一次 conversation 轮询的观察结果,用于定位卡在哪一层。
+type PollDebug struct {
+	Attempts           int
+	ConversationErrors int
+	RateLimitHits      int
+	ToolMessages       int
+	NewToolMessages    int
+	LastToolModelSlug  string
+	LastToolRecipient  string
+	LastToolAuthor     string
+	LastToolTitle      string
+	LastError          string
+}
+
 func normalizePollOpts(opt PollOpts) PollOpts {
 	if opt.ExpectedN <= 0 {
 		opt.ExpectedN = 1
@@ -530,9 +544,10 @@ func normalizePollOpts(opt PollOpts) PollOpts {
 //
 // 返回 (status, file_ids, sediment_ids)。status=success 时 file_ids/sediment_ids 至少一个非空。
 // file-service 优先(优先级更高),sediment 作为补充一并带出,调用方自行决定用几张。
-func (c *Client) PollConversationForImages(ctx context.Context, convID string, opt PollOpts) (PollStatus, []string, []string) {
+func (c *Client) PollConversationForImages(ctx context.Context, convID string, opt PollOpts) (PollStatus, []string, []string, PollDebug) {
 	opt = normalizePollOpts(opt)
 	baseline := opt.BaselineToolIDs
+	var dbg PollDebug
 
 	deadline := time.Now().Add(opt.MaxWait)
 
@@ -546,18 +561,23 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 	)
 
 	for time.Now().Before(deadline) {
+		dbg.Attempts++
 		select {
 		case <-ctx.Done():
-			return PollStatusError, nil, nil
+			dbg.LastError = ctx.Err().Error()
+			return PollStatusError, nil, nil, dbg
 		default:
 		}
 
 		mapping, err := c.getMappingRaw(ctx, convID)
 		if err != nil {
+			dbg.ConversationErrors++
+			dbg.LastError = err.Error()
 			if ue, ok := err.(*UpstreamError); ok && ue.Status == 429 {
 				consecutive429++
+				dbg.RateLimitHits++
 				if consecutive429 >= 3 {
-					return PollStatusError, nil, nil
+					return PollStatusError, nil, nil, dbg
 				}
 				sleep(ctx, 10*time.Second)
 				continue
@@ -568,6 +588,7 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 		consecutive429 = 0
 
 		msgs := ExtractImageToolMsgs(mapping)
+		dbg.ToolMessages = len(msgs)
 		// baseline diff:只看本回合新增 tool 消息
 		var newMsgs []ImageToolMsg
 		if len(baseline) > 0 {
@@ -578,6 +599,14 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 			}
 		} else {
 			newMsgs = msgs
+		}
+		dbg.NewToolMessages = len(newMsgs)
+		if len(newMsgs) > 0 {
+			last := newMsgs[len(newMsgs)-1]
+			dbg.LastToolModelSlug = last.ModelSlug
+			dbg.LastToolRecipient = last.Recipient
+			dbg.LastToolAuthor = last.AuthorName
+			dbg.LastToolTitle = last.ImageGenTitle
 		}
 
 		// 跨 tool 消息聚合 fid/sid。IMG2 一次调用可能先出 sediment 预览再补
@@ -599,7 +628,7 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 
 		// 够 N 张立即短路返回(file-service 优先占配额,sediment 补位)
 		if len(allFile)+len(allSed) >= opt.ExpectedN {
-			return PollStatusSuccess, allFile, allSed
+			return PollStatusSuccess, allFile, allSed, dbg
 		}
 
 		sleep(ctx, opt.Interval)
@@ -607,9 +636,9 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 
 	// 超时兜底:只要拿到过至少 1 张,就算成功(速度优先,不等齐 N)
 	if len(allFile)+len(allSed) > 0 {
-		return PollStatusSuccess, allFile, allSed
+		return PollStatusSuccess, allFile, allSed, dbg
 	}
-	return PollStatusTimeout, nil, nil
+	return PollStatusTimeout, nil, nil, dbg
 }
 
 // getMappingRaw 拉 conversation 并返回 mapping。

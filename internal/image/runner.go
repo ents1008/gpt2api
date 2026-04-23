@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -104,6 +105,53 @@ func normalizeRunOptions(opt RunOptions) RunOptions {
 	return opt
 }
 
+func composeStoredTaskError(code, raw string) string {
+	if raw == "" || raw == code {
+		return code
+	}
+	return code + ": " + raw
+}
+
+func buildPollTimeoutMessage(sse chatgpt.ImageSSEResult, dbg chatgpt.PollDebug, turnstileRequired, freeAccount bool) string {
+	parts := []string{"no_image_ref"}
+	if turnstileRequired {
+		parts = append(parts, "turnstile_required")
+	}
+	if freeAccount {
+		parts = append(parts, "free_account")
+	}
+	if sse.ImageGenTaskID != "" {
+		parts = append(parts, "image_gen_task_started")
+	}
+	if sse.FinishType != "" {
+		parts = append(parts, "finish_type="+sse.FinishType)
+	}
+	if dbg.NewToolMessages == 0 {
+		parts = append(parts, "no_tool_messages")
+	} else {
+		parts = append(parts, fmt.Sprintf("tool_messages=%d", dbg.NewToolMessages))
+	}
+	if dbg.Attempts > 0 {
+		parts = append(parts, fmt.Sprintf("poll_attempts=%d", dbg.Attempts))
+	}
+	if dbg.ConversationErrors > 0 {
+		parts = append(parts, fmt.Sprintf("conversation_errors=%d", dbg.ConversationErrors))
+	}
+	if dbg.RateLimitHits > 0 {
+		parts = append(parts, fmt.Sprintf("poll_429=%d", dbg.RateLimitHits))
+	}
+	if dbg.LastToolModelSlug != "" {
+		parts = append(parts, "last_tool_model="+dbg.LastToolModelSlug)
+	}
+	if dbg.LastToolRecipient != "" {
+		parts = append(parts, "last_tool_recipient="+dbg.LastToolRecipient)
+	}
+	if dbg.LastError != "" {
+		parts = append(parts, "last_error="+dbg.LastError)
+	}
+	return strings.Join(parts, "; ")
+}
+
 // Run 执行生图。会同步阻塞直到完成/失败;调用方自行做超时控制(传 ctx)。
 func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 	start := time.Now()
@@ -173,7 +221,8 @@ func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 			})
 		} else {
 			persistTaskWrite(opt.TaskID, "mark_failed", func(writeCtx context.Context) error {
-				return r.dao.MarkFailed(writeCtx, opt.TaskID, result.ErrorCode)
+				return r.dao.MarkFailed(writeCtx, opt.TaskID,
+					composeStoredTaskError(result.ErrorCode, result.ErrorMessage))
 			})
 		}
 	}
@@ -239,6 +288,13 @@ func (r *Runner) runOnce(ctx context.Context, opt RunOptions, result *RunResult)
 			return false, ErrPOWFailed, errors.New("pow solver returned empty")
 		}
 	}
+	logger.L().Info("image runner chat requirements",
+		zap.String("task_id", opt.TaskID),
+		zap.Uint64("account_id", lease.Account.ID),
+		zap.String("persona", cr.Persona),
+		zap.Bool("turnstile_required", cr.Turnstile.Required),
+		zap.Bool("pow_required", cr.Proofofwork.Required),
+	)
 	// Turnstile 是"建议性"信号:即使服务端声明 required,只要 chat_token + proof_token
 	// 齐全,绝大多数账号的 f/conversation 仍然会正常下发图片结果。与 chat 流程(gateway/chat.go)
 	// 保持一致——只打 warn,不阻断;真正拿不到 IMG2 终稿时由后续 poll 逻辑判定为失败。
@@ -309,9 +365,18 @@ func (r *Runner) runOnce(ctx context.Context, opt RunOptions, result *RunResult)
 	// Prepare(conduit_token;拿不到也能降级继续)
 	if ct, err := cli.PrepareFConversation(ctx, convOpt); err == nil {
 		convOpt.ConduitToken = ct
+		logger.L().Info("image runner prepare ok",
+			zap.String("task_id", opt.TaskID),
+			zap.Uint64("account_id", lease.Account.ID),
+			zap.Bool("has_conduit_token", ct != ""))
 	} else if ue, ok := err.(*chatgpt.UpstreamError); ok && ue.IsRateLimited() {
 		r.sched.MarkRateLimited(context.Background(), lease.Account.ID)
 		return false, ErrRateLimited, err
+	} else if err != nil {
+		logger.L().Warn("image runner prepare failed",
+			zap.String("task_id", opt.TaskID),
+			zap.Uint64("account_id", lease.Account.ID),
+			zap.Error(err))
 	}
 
 	// f/conversation SSE
@@ -365,7 +430,7 @@ func (r *Runner) runOnce(ctx context.Context, opt RunOptions, result *RunResult)
 			ExpectedN: opt.N,
 			MaxWait:   opt.PollMaxWait,
 		}
-		status, fids, sids := cli.PollConversationForImages(ctx, convID, pollOpt)
+		status, fids, sids, dbg := cli.PollConversationForImages(ctx, convID, pollOpt)
 		logger.L().Info("image runner poll done",
 			zap.String("task_id", opt.TaskID),
 			zap.Uint64("account_id", lease.Account.ID),
@@ -375,6 +440,16 @@ func (r *Runner) runOnce(ctx context.Context, opt RunOptions, result *RunResult)
 			zap.Strings("poll_fids_list", fids),
 			zap.Int("poll_sids", len(sids)),
 			zap.Strings("poll_sids_list", sids),
+			zap.Int("poll_attempts", dbg.Attempts),
+			zap.Int("poll_conversation_errors", dbg.ConversationErrors),
+			zap.Int("poll_429", dbg.RateLimitHits),
+			zap.Int("poll_tool_messages", dbg.ToolMessages),
+			zap.Int("poll_new_tool_messages", dbg.NewToolMessages),
+			zap.String("poll_last_tool_model", dbg.LastToolModelSlug),
+			zap.String("poll_last_tool_recipient", dbg.LastToolRecipient),
+			zap.String("poll_last_tool_author", dbg.LastToolAuthor),
+			zap.String("poll_last_tool_title", dbg.LastToolTitle),
+			zap.String("poll_last_error", dbg.LastError),
 		)
 		switch status {
 		case chatgpt.PollStatusSuccess:
@@ -399,9 +474,14 @@ func (r *Runner) runOnce(ctx context.Context, opt RunOptions, result *RunResult)
 				fileRefs = append(fileRefs, key)
 			}
 		case chatgpt.PollStatusTimeout:
-			return false, ErrPollTimeout, errors.New("poll timeout without any image")
+			detail := buildPollTimeoutMessage(sseResult, dbg, cr.Turnstile.Required, cr.IsFreeAccount())
+			return false, ErrPollTimeout, errors.New(detail)
 		default:
-			return false, ErrUpstream, errors.New("poll error")
+			reason := "poll error"
+			if dbg.LastError != "" {
+				reason += ": " + dbg.LastError
+			}
+			return false, ErrUpstream, errors.New(reason)
 		}
 	}
 
@@ -430,14 +510,14 @@ func (r *Runner) runOnce(ctx context.Context, opt RunOptions, result *RunResult)
 		zap.String("task_id", opt.TaskID),
 		zap.Uint64("account_id", lease.Account.ID),
 		zap.String("conv_id", convID),
-		zap.Int("refs", len(fileRefs)),
-		zap.Strings("refs_list", fileRefs),
+		zap.Int("refs", min(opt.N, len(fileRefs))),
+		zap.Strings("refs_list", fileRefs[:min(opt.N, len(fileRefs))]),
 		zap.Int("signed_count", len(signedURLs)),
 	)
 
-	result.FileIDs = fileRefs
-	result.SignedURLs = signedURLs
-	result.ContentTypes = contentTypes
+	result.FileIDs = slices.Clone(fileRefs[:min(opt.N, len(fileRefs))])
+	result.SignedURLs = slices.Clone(signedURLs[:min(opt.N, len(signedURLs))])
+	result.ContentTypes = slices.Clone(contentTypes[:min(opt.N, len(contentTypes))])
 	return true, "", nil
 }
 
