@@ -277,7 +277,8 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 	defer cancel()
 
 	// 带参考图时,多轮重试没什么意义(反而会重复上传参考图),只留 1 次尝试。
-	maxAttempts := 2
+	// 纯文生图则放宽到 4 次,避免连续命中两个失效号就直接 502。
+	maxAttempts := 4
 	if len(refs) > 0 {
 		maxAttempts = 1
 	}
@@ -490,7 +491,7 @@ func (h *ImagesHandler) handleChatAsImage(c *gin.Context, rec *usage.Log, ak *ap
 		UpstreamModel: m.UpstreamModelSlug,
 		Prompt:        maybeAppendClaritySuffix(prompt),
 		N:             1,
-		MaxAttempts:   2,
+		MaxAttempts:   4,
 	})
 	rec.AccountID = res.AccountID
 
