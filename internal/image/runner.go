@@ -162,9 +162,9 @@ func classifyPollFailureCode(sse chatgpt.ImageSSEResult, dbg chatgpt.PollDebug, 
 		return ErrConversationPoll
 	case dbg.NewToolMessages > 0:
 		return ErrImageToolNoAsset
-	case turnstileRequired && sse.ImageGenTaskID != "":
+	case turnstileRequired:
 		return ErrTurnstileStalled
-	case freeAccount && sse.ImageGenTaskID != "":
+	case freeAccount:
 		return ErrFreeAccountStalled
 	case sse.ImageGenTaskID != "":
 		return ErrImageTaskStalled

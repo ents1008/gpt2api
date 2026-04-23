@@ -118,6 +118,11 @@ func TestClassifyPollFailureCode(t *testing.T) {
 			want:              ErrTurnstileStalled,
 		},
 		{
+			name:              "turnstile blocks before image task id gets dedicated code",
+			turnstileRequired: true,
+			want:              ErrTurnstileStalled,
+		},
+		{
 			name: "free account stalled task gets dedicated code",
 			sse: chatgpt.ImageSSEResult{
 				ImageGenTaskID: "task_123",
