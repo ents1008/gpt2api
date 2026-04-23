@@ -45,12 +45,12 @@ type RunOptions struct {
 	UserID            uint64
 	KeyID             uint64
 	ModelID           uint64
-	UpstreamModel     string           // 默认 "auto"(由上游根据 system_hints 挑选图像模型)
+	UpstreamModel     string // 默认 "auto"(由上游根据 system_hints 挑选图像模型)
 	Prompt            string
 	N                 int              // 期望返回的图片张数;够数 Poll 就立即返回(速度优先)
 	MaxAttempts       int              // 跨账号重试次数,仅用于无账号/限流等硬错误,默认 1
-	PerAttemptTimeout time.Duration    // 单次尝试总超时,默认 2min
-	PollMaxWait       time.Duration    // SSE 没直出时,轮询 conversation 的最长等待,默认 60s
+	PerAttemptTimeout time.Duration    // 单次尝试总超时,默认 6min
+	PollMaxWait       time.Duration    // SSE 没直出时,轮询 conversation 的最长等待,默认 5min
 	References        []ReferenceImage // 图生图/编辑:参考图
 }
 
@@ -80,19 +80,17 @@ func persistTaskWrite(taskID, op string, fn func(context.Context) error) {
 	}
 }
 
-// Run 执行生图。会同步阻塞直到完成/失败;调用方自行做超时控制(传 ctx)。
-func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
-	start := time.Now()
+func normalizeRunOptions(opt RunOptions) RunOptions {
 	if opt.MaxAttempts <= 0 {
 		// 默认只跑 1 次,不为"没命中"做跨账号重试。
-		// 仅当首轮因为没调度到账号 / 账号被硬限流时,才会用 MaxAttempts>1 做 1 次换账号重试。
+		// 仅当首轮因为没调度到账号 / 账号被硬限流时,才会用 MaxAttempts>1 做换账号重试。
 		opt.MaxAttempts = 1
 	}
 	if opt.PerAttemptTimeout <= 0 {
-		opt.PerAttemptTimeout = 2 * time.Minute
+		opt.PerAttemptTimeout = 6 * time.Minute
 	}
 	if opt.PollMaxWait <= 0 {
-		opt.PollMaxWait = 60 * time.Second
+		opt.PollMaxWait = 5 * time.Minute
 	}
 	if opt.UpstreamModel == "" {
 		// 对齐浏览器抓包 + 参考实现:图像走 f/conversation 时 model 字段和
@@ -103,6 +101,13 @@ func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 	if opt.N <= 0 {
 		opt.N = 1
 	}
+	return opt
+}
+
+// Run 执行生图。会同步阻塞直到完成/失败;调用方自行做超时控制(传 ctx)。
+func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
+	start := time.Now()
+	opt = normalizeRunOptions(opt)
 
 	result := &RunResult{Status: StatusFailed, ErrorCode: ErrUnknown}
 

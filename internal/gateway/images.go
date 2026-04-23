@@ -272,8 +272,8 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 
 	// 5) 执行(同步阻塞)
 	//
-	// 单请求硬上限 6 分钟:单个 attempt 5 分钟 + 可能的 preview_only 重试余量。
-	runCtx, cancel := detachedImageRunContext(6 * time.Minute)
+	// 单请求硬上限 8 分钟:给 5 分钟轮询和前置 prepare/SSE 留足缓冲。
+	runCtx, cancel := detachedImageRunContext(8 * time.Minute)
 	defer cancel()
 
 	// 带参考图时,多轮重试没什么意义(反而会重复上传参考图),只留 1 次尝试。
@@ -480,7 +480,7 @@ func (h *ImagesHandler) handleChatAsImage(c *gin.Context, rec *usage.Log, ak *ap
 		})
 	}
 
-	runCtx, cancel := detachedImageRunContext(6 * time.Minute)
+	runCtx, cancel := detachedImageRunContext(8 * time.Minute)
 	defer cancel()
 
 	res := h.Runner.Run(runCtx, image.RunOptions{
