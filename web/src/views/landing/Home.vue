@@ -11,13 +11,12 @@ const user = useUserStore()
 const ui = useUIStore()
 const site = useSiteStore()
 
-const siteName = computed(() => site.get('site.name', 'GPT2API'))
+const siteName = computed(() => site.get('site.name', '积云'))
 const siteLogo = computed(() => site.get('site.logo_url', ''))
 const allowRegister = computed(() => site.allowRegister())
 const loggedIn = computed(() => user.isLoggedIn)
 
 const brand = brandParts()
-const repoHref = `https://${brand.repo}`
 const qqHref = `https://qm.qq.com/q/${brand.qq}`
 
 function goPlay() {
@@ -71,9 +70,6 @@ const features = [
           <span class="logo-name">{{ siteName }}</span>
         </a>
         <nav class="menu">
-          <a :href="repoHref" target="_blank" rel="noopener">
-            GitHub <el-icon :size="13" class="ext"><TopRight /></el-icon>
-          </a>
           <a :href="qqHref" target="_blank" rel="noopener">QQ 群 {{ brand.qq }}</a>
         </nav>
         <div class="nav-actions">
@@ -117,17 +113,13 @@ const features = [
             <el-button size="large" type="primary" round @click="goPlay">
               <el-icon><VideoPlay /></el-icon> 立即体验在线生图
             </el-button>
-            <el-button size="large" round plain tag="a" :href="repoHref" target="_blank">
-              <el-icon><Link /></el-icon> GitHub 仓库
+            <el-button size="large" round plain tag="a" :href="qqHref" target="_blank" rel="noopener">
+              <el-icon><Service /></el-icon> 加入交流QQ群
             </el-button>
           </div>
           <div class="hero-meta">
             <a class="meta-link" :href="qqHref" target="_blank" rel="noopener">
               <el-icon><Service /></el-icon> {{ brand.qqLabel }}{{ brand.qq }}
-            </a>
-            <span class="dot-sep">·</span>
-            <a class="meta-link" :href="brand.picUrl" target="_blank" rel="noopener">
-              <el-icon><PictureFilled /></el-icon> {{ brand.picLabel }}{{ brand.picText }}
             </a>
           </div>
         </div>
@@ -170,11 +162,7 @@ const features = [
       <div class="footer-inner">
         <span>© {{ new Date().getFullYear() }} {{ siteName }} · gpt-image-2 终稿直出网关</span>
         <span class="sep">·</span>
-        <a :href="repoHref" target="_blank" rel="noopener">{{ brand.repoLabel }}{{ brand.repo }}</a>
-        <span class="sep">·</span>
         <a :href="qqHref" target="_blank" rel="noopener">{{ brand.qqLabel }}{{ brand.qq }}</a>
-        <span class="sep">·</span>
-        <a :href="brand.picUrl" target="_blank" rel="noopener">{{ brand.picLabel }}{{ brand.picText }}</a>
       </div>
     </footer>
   </div>
