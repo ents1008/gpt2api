@@ -52,6 +52,10 @@ const (
 	PermModelRead    = Permission("model:read")
 	PermModelWrite   = Permission("model:write")
 
+	// 上游渠道(OpenAI/Gemini 等外置供应商) + 模型映射
+	PermChannelRead  = Permission("channel:read")
+	PermChannelWrite = Permission("channel:write")
+
 	// 分组 / 计费
 	PermGroupWrite     = Permission("group:write")
 	PermRechargeManage = Permission("recharge:manage")
@@ -85,6 +89,7 @@ var rolePermissions = map[string][]Permission{
 		PermAccountRead, PermAccountWrite,
 		PermProxyRead, PermProxyWrite,
 		PermModelRead, PermModelWrite,
+		PermChannelRead, PermChannelWrite,
 		PermGroupWrite, PermRechargeManage,
 		PermUsageReadAll, PermStatsReadAll, PermAuditRead,
 		PermSystemSetting, PermSystemBackup,

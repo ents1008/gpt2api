@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useUserStore } from '@/stores/user'
@@ -23,12 +23,44 @@ const brand = brandParts()
 const brandQQHref = `https://qm.qq.com/q/${brand.qq}`
 
 const { menu, user, role, permissions } = storeToRefs(store)
-const collapsed = ref(false)
+const collapsed = ref(false)      // 桌面端折叠状态
+const drawerOpen = ref(false)     // 移动端抽屉展开状态
+const isMobile = ref(false)
 const loadingMenu = ref(false)
+
+const MOBILE_BP = 768
+
+function checkMobile() {
+  const mobile = window.innerWidth < MOBILE_BP
+  if (mobile !== isMobile.value) {
+    isMobile.value = mobile
+    if (!mobile) drawerOpen.value = false  // 切换到桌面时自动关抽屉
+  }
+}
+
+// 顶栏汉堡按钮行为:移动端控制抽屉,桌面端控制折叠
+function toggleSidebar() {
+  if (isMobile.value) {
+    drawerOpen.value = !drawerOpen.value
+  } else {
+    collapsed.value = !collapsed.value
+  }
+}
+
+// 侧栏图标:移动端始终用 Menu 图标,桌面端跟随折叠状态
+const menuIcon = computed(() => {
+  if (isMobile.value) return 'Menu'
+  return collapsed.value ? 'Expand' : 'Fold'
+})
+
+// 侧栏实际是否折叠(移动端抽屉展开时不折叠)
+const sideCollapsed = computed(() => isMobile.value ? false : collapsed.value)
+
+// 侧栏宽度(桌面端动态;移动端固定 240px 由 CSS 管理)
+const asideWidth = computed(() => isMobile.value ? '0px' : (collapsed.value ? '64px' : '220px'))
 
 const activePath = computed(() => route.path)
 
-// 生成面包屑用的路径映射
 const titleMap = computed(() => {
   const m = new Map<string, string>()
   function walk(items: MenuItem[]) {
@@ -62,21 +94,41 @@ function goto(path?: string) {
   if (path) router.push(path)
 }
 
-onMounted(loadMenu)
+// 路由切换时关闭移动端抽屉
+watch(() => route.path, () => {
+  if (isMobile.value) drawerOpen.value = false
+})
+
+onMounted(() => {
+  checkMobile()
+  window.addEventListener('resize', checkMobile)
+  loadMenu()
+})
+onUnmounted(() => window.removeEventListener('resize', checkMobile))
 watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
 </script>
 
 <template>
   <el-container class="layout-root">
-    <el-aside :width="collapsed ? '64px' : '220px'" class="sidebar">
+    <!-- 移动端遮罩层 -->
+    <transition name="overlay-fade">
+      <div v-if="isMobile && drawerOpen" class="sidebar-overlay" @click="drawerOpen = false" />
+    </transition>
+
+    <!-- 侧栏:桌面 inline / 移动端 fixed drawer -->
+    <el-aside
+      :width="asideWidth"
+      class="sidebar"
+      :class="{ 'sidebar-mobile': isMobile, 'sidebar-open': isMobile && drawerOpen }"
+    >
       <div class="logo">
         <img v-if="siteLogo" :src="siteLogo" class="logo-img" alt="logo" />
         <span v-else class="mark">{{ (siteName[0] || 'G').toUpperCase() }}</span>
-        <span v-if="!collapsed" class="title">{{ siteName }}</span>
+        <span v-if="!sideCollapsed" class="title">{{ siteName }}</span>
       </div>
       <el-menu
         :default-active="activePath"
-        :collapse="collapsed"
+        :collapse="sideCollapsed"
         background-color="transparent"
         text-color="#cfd3dc"
         active-text-color="#ffffff"
@@ -84,12 +136,10 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
         router
       >
         <template v-for="group in menu" :key="group.key">
-          <!-- 无子节点:直接渲染成一级 item -->
           <el-menu-item v-if="!group.children?.length && group.path" :index="group.path">
             <el-icon v-if="group.icon"><component :is="group.icon" /></el-icon>
             <template #title>{{ group.title }}</template>
           </el-menu-item>
-          <!-- 有子节点:分组 -->
           <el-sub-menu v-else-if="group.children?.length" :index="group.key">
             <template #title>
               <el-icon v-if="group.icon"><component :is="group.icon" /></el-icon>
@@ -107,17 +157,16 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
         </template>
       </el-menu>
 
-      <!-- 版本号 -->
-      <div class="sidebar-version" :class="{ collapsed }">
-        <span class="ver-text">{{ collapsed ? APP_VERSION.replace('v','') : APP_VERSION }}</span>
+      <div class="sidebar-version" :class="{ collapsed: sideCollapsed }">
+        <span class="ver-text">{{ sideCollapsed ? APP_VERSION.replace('v','') : APP_VERSION }}</span>
       </div>
     </el-aside>
 
-    <el-container>
+    <el-container class="right-container">
       <el-header class="topbar">
         <div class="left">
-          <el-button link @click="collapsed = !collapsed">
-            <el-icon :size="18"><component :is="collapsed ? 'Expand' : 'Fold'" /></el-icon>
+          <el-button link @click="toggleSidebar">
+            <el-icon :size="18"><component :is="menuIcon" /></el-icon>
           </el-button>
           <span class="crumb">{{ currentTitle }}</span>
         </div>
@@ -135,7 +184,7 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
                 {{ (user?.nickname || user?.email || 'U').slice(0, 1).toUpperCase() }}
               </el-avatar>
               <span class="nick">{{ user?.nickname || user?.email }}</span>
-              <el-tag v-if="role === 'admin'" type="warning" size="small">管理员</el-tag>
+              <el-tag v-if="role === 'admin' && !isMobile" type="warning" size="small">管理员</el-tag>
               <el-icon><ArrowDown /></el-icon>
             </span>
             <template #dropdown>
@@ -177,11 +226,15 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
 </template>
 
 <style scoped lang="scss">
-.layout-root { height: 100vh; }
+// ─── 根容器 ──────────────────────────────────────────────────────────────────
+.layout-root { height: 100vh; overflow: hidden; }
 
+.right-container { min-width: 0; flex: 1; overflow: hidden; }
+
+// ─── 侧栏 ────────────────────────────────────────────────────────────────────
 .sidebar {
   background: var(--gp-sidebar-bg);
-  transition: width .2s;
+  transition: width .22s ease;
   overflow-x: hidden;
   display: flex !important;
   flex-direction: column;
@@ -192,6 +245,34 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
   }
 }
 
+// 移动端：侧栏脱离文档流变成 fixed overlay drawer
+.sidebar-mobile {
+  position: fixed !important;
+  left: 0;
+  top: 0;
+  height: 100vh;
+  width: 240px !important;  // 覆盖 :width 绑定
+  z-index: 1001;
+  transform: translateX(-100%);
+  transition: transform .25s ease, box-shadow .25s ease;
+  box-shadow: none;
+}
+.sidebar-mobile.sidebar-open {
+  transform: translateX(0);
+  box-shadow: 4px 0 24px rgba(0, 0, 0, 0.35);
+}
+
+// 移动端遮罩
+.sidebar-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 1000;
+}
+.overlay-fade-enter-active, .overlay-fade-leave-active { transition: opacity .25s; }
+.overlay-fade-enter-from, .overlay-fade-leave-to { opacity: 0; }
+
+// ─── Logo ─────────────────────────────────────────────────────────────────────
 .logo {
   height: 60px;
   display: flex;
@@ -201,19 +282,21 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
   color: #fff;
   font-weight: 700;
   letter-spacing: 1px;
+  flex-shrink: 0;
   .logo-img {
-    width: 32px; height: 32px; border-radius: 8px; object-fit: contain; background: #fff;
+    width: 32px; height: 32px; border-radius: 8px;
+    object-fit: contain; background: #fff;
   }
   .mark {
     display: inline-flex;
-    width: 32px;
-    height: 32px;
+    width: 32px; height: 32px;
     border-radius: 8px;
     background: linear-gradient(135deg,#409eff,#67c23a);
     align-items: center; justify-content: center;
     font-size: 14px;
+    flex-shrink: 0;
   }
-  .title { font-size: 16px; }
+  .title { font-size: 16px; white-space: nowrap; overflow: hidden; }
 }
 
 .side-menu {
@@ -221,38 +304,58 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
   --el-menu-hover-bg-color: rgba(255,255,255,0.06);
 }
 
+// ─── 顶栏 ─────────────────────────────────────────────────────────────────────
 .topbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   height: 56px;
+  min-height: 56px;
   background: var(--el-bg-color);
   color: var(--el-text-color-primary);
   border-bottom: 1px solid var(--el-border-color-light);
   padding: 0 18px;
-  .left { display: flex; align-items: center; gap: 12px; }
-  .crumb { font-size: 16px; font-weight: 600; }
+  flex-shrink: 0;
+  .left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .crumb {
+    font-size: 16px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .user-entry {
     display: inline-flex;
     align-items: center;
     gap: 8px;
     cursor: pointer;
     color: var(--el-text-color-primary);
-    .nick { font-size: 14px; }
+    .nick {
+      font-size: 14px;
+      max-width: 120px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
   }
   .right {
     display: inline-flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
+    flex-shrink: 0;
   }
   .theme-btn { padding: 0 6px; }
 }
 
+// ─── 主区 ─────────────────────────────────────────────────────────────────────
 .main {
   background: var(--gp-bg);
   padding: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
+// ─── 页脚 ─────────────────────────────────────────────────────────────────────
 .footer {
   background: transparent;
   text-align: center;
@@ -266,6 +369,7 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
   align-items: center;
   justify-content: center;
   gap: 2px;
+  flex-shrink: 0;
 }
 .footer-line { line-height: 1.6; }
 .brand-line .brand-name {
@@ -278,21 +382,16 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
   margin: 0 4px;
   user-select: none;
 }
-.footer-custom {
-  color: var(--el-text-color-placeholder);
-  font-size: 11px;
-}
-.footer-link {
-  color: var(--el-color-primary);
-  text-decoration: none;
-  margin: 0 2px;
-}
+.footer-custom { color: var(--el-text-color-placeholder); font-size: 11px; }
+.footer-link { color: var(--el-color-primary); text-decoration: none; margin: 0 2px; }
 .footer-link.pic-link { color: var(--el-color-success); }
 .footer-link:hover { text-decoration: underline; }
 
+// ─── 过渡 ─────────────────────────────────────────────────────────────────────
 .fade-enter-active, .fade-leave-active { transition: opacity .15s; }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
 
+// ─── 版本号 ───────────────────────────────────────────────────────────────────
 .sidebar-version {
   position: sticky;
   bottom: 0;
@@ -300,6 +399,7 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
   text-align: center;
   border-top: 1px solid rgba(255,255,255,0.07);
   background: var(--gp-sidebar-bg);
+  flex-shrink: 0;
   .ver-text {
     display: inline-block;
     font-size: 11px;
@@ -308,9 +408,16 @@ watch(() => store.isLoggedIn, (v) => { if (v) loadMenu() })
     user-select: none;
     white-space: nowrap;
   }
-  &.collapsed .ver-text {
-    font-size: 9px;
-    letter-spacing: 0;
+  &.collapsed .ver-text { font-size: 9px; letter-spacing: 0; }
+}
+
+// ─── 移动端补丁 ───────────────────────────────────────────────────────────────
+@media (max-width: 767px) {
+  .topbar {
+    padding: 0 12px;
+    .crumb { font-size: 14px; }
+    .nick { display: none; }
   }
+  .footer { display: none; }  // 移动端页脚占空间,隐藏
 }
 </style>

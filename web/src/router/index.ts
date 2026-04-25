@@ -70,6 +70,8 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '代理管理', perm: 'proxy:read' } },
       { path: 'models', component: () => import('@/views/admin/Models.vue'),
         meta: { title: '模型配置', perm: ['model:read', 'model:write'] } },
+      { path: 'channels', component: () => import('@/views/admin/Channels.vue'),
+        meta: { title: '上游渠道', perm: ['channel:read', 'channel:write'] } },
       { path: 'groups', component: () => import('@/views/admin/Groups.vue'),
         meta: { title: '用户分组', perm: 'group:write' } },
       { path: 'usage', component: () => import('@/views/admin/UsageStats.vue'),

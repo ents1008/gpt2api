@@ -53,6 +53,8 @@ var menuTree = []Menu{
 				Perms: []Permission{PermProxyRead}},
 			{Key: "admin.models", Title: "模型配置", Icon: "Box", Path: "/admin/models",
 				Perms: []Permission{PermModelRead, PermModelWrite}},
+			{Key: "admin.channels", Title: "上游渠道", Icon: "Share", Path: "/admin/channels",
+				Perms: []Permission{PermChannelRead, PermChannelWrite}},
 			{Key: "admin.groups", Title: "用户分组", Icon: "OfficeBuilding", Path: "/admin/groups",
 				Perms: []Permission{PermGroupWrite}},
 			{Key: "admin.usage", Title: "用量统计", Icon: "DataAnalysis", Path: "/admin/usage",

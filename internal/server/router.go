@@ -8,6 +8,7 @@ import (
 	"github.com/432539/gpt2api/internal/audit"
 	"github.com/432539/gpt2api/internal/auth"
 	"github.com/432539/gpt2api/internal/backup"
+	"github.com/432539/gpt2api/internal/channel"
 	"github.com/432539/gpt2api/internal/config"
 	"github.com/432539/gpt2api/internal/gateway"
 	"github.com/432539/gpt2api/internal/image"
@@ -35,6 +36,7 @@ type Deps struct {
 	KeyH       *apikey.Handler
 	ProxyH     *proxy.Handler
 	AccountH   *account.Handler
+	ChannelH   *channel.Handler
 
 	GatewayH *gateway.Handler
 	ImagesH  *gateway.ImagesHandler
@@ -254,6 +256,32 @@ func New(d *Deps) *gin.Engine {
 			// 生成记录(管理员全局视图)
 			if d.AdminImageH != nil {
 				admin.GET("/image-tasks", middleware.RequirePerm(rbac.PermUsageReadAll), d.AdminImageH.List)
+			}
+
+			// ---- 上游渠道(OpenAI/Gemini 兼容) ----
+			if d.ChannelH != nil {
+				cg := admin.Group("/channels",
+					middleware.RequirePerm(rbac.PermChannelRead, rbac.PermChannelWrite))
+				{
+					cg.GET("", d.ChannelH.List)
+					cg.POST("", middleware.RequirePerm(rbac.PermChannelWrite), d.ChannelH.Create)
+					cg.GET("/:id", d.ChannelH.Get)
+					cg.PATCH("/:id", middleware.RequirePerm(rbac.PermChannelWrite), d.ChannelH.Update)
+					cg.DELETE("/:id", middleware.RequirePerm(rbac.PermChannelWrite), d.ChannelH.Delete)
+					cg.POST("/:id/test", middleware.RequirePerm(rbac.PermChannelWrite), d.ChannelH.Test)
+					cg.GET("/:id/mappings", d.ChannelH.ListMappings)
+					cg.POST("/:id/mappings",
+						middleware.RequirePerm(rbac.PermChannelWrite), d.ChannelH.CreateMapping)
+				}
+				// 映射单条操作:另起一组,避免和 /channels/:id 冲突。
+				mg := admin.Group("/channel-mappings",
+					middleware.RequirePerm(rbac.PermChannelRead, rbac.PermChannelWrite))
+				{
+					mg.PATCH("/:mid",
+						middleware.RequirePerm(rbac.PermChannelWrite), d.ChannelH.UpdateMapping)
+					mg.DELETE("/:mid",
+						middleware.RequirePerm(rbac.PermChannelWrite), d.ChannelH.DeleteMapping)
+				}
 			}
 
 			// ---- 模型配置 ----

@@ -56,6 +56,89 @@ html, body, #app {
 // 表格内按钮紧凑
 .el-table .el-button + .el-button { margin-left: 6px; }
 
+// ─── 移动端响应式 ─────────────────────────────────────────────────────────────
+
+// 表格容器:超宽时横向滚动
+.table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+// 工具栏(搜索区 + 操作按钮):小屏自动换行
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+@media (max-width: 767px) {
+  .page-container {
+    padding: 12px;
+  }
+
+  .card-block {
+    padding: 14px 12px;
+  }
+
+  .page-title {
+    font-size: 16px;
+    margin-bottom: 12px;
+  }
+
+  // 表格横向滚动
+  .el-table {
+    overflow-x: auto;
+    font-size: 13px;
+  }
+
+  // 操作列按钮纵向排列
+  .el-table .cell .el-button {
+    margin: 2px 0;
+    display: block;
+    width: 100%;
+  }
+
+  // 分页组件紧凑
+  .el-pagination {
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 4px;
+
+    .el-pagination__total,
+    .el-pagination__sizes {
+      display: none;
+    }
+  }
+
+  // 对话框全屏化
+  .el-dialog {
+    width: 95vw !important;
+    margin: 4vh auto !important;
+  }
+
+  // 表单标签换行
+  .el-form-item {
+    .el-form-item__label {
+      float: none;
+      display: block;
+      text-align: left;
+      padding-bottom: 4px;
+      line-height: 1.4;
+    }
+    .el-form-item__content {
+      margin-left: 0 !important;
+    }
+  }
+
+  // flex-between 在移动端改为换行
+  .flex-between {
+    flex-wrap: wrap;
+  }
+}
+
 /* ------------------------------------------------------------------
  * 滚动条统一风格
  *

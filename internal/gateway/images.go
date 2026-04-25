@@ -215,6 +215,14 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 		}
 	}
 
+	// 若本地模型配置了外置渠道(OpenAI DALL·E / Gemini imagen 等),优先走渠道。
+	// 参考图场景(reference_images)仍走原 ChatGPT 账号池 Runner。
+	if h.Channels != nil {
+		if handled := h.dispatchImageToChannel(c, ak, m, &req, rec, ratio); handled {
+			return
+		}
+	}
+
 	// 3) 预扣(图像按定价,est = actual)
 	cost := billing.ComputeImageCost(m, req.N, ratio)
 	if cost > 0 {

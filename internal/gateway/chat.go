@@ -25,6 +25,7 @@ import (
 
 	"github.com/432539/gpt2api/internal/apikey"
 	"github.com/432539/gpt2api/internal/billing"
+	"github.com/432539/gpt2api/internal/channel"
 	modelpkg "github.com/432539/gpt2api/internal/model"
 	"github.com/432539/gpt2api/internal/ratelimit"
 	"github.com/432539/gpt2api/internal/scheduler"
@@ -48,6 +49,10 @@ type Handler struct {
 	}
 	// Images 可选:若挂载,chat/completions 里指定图像模型会自动转派。
 	Images *ImagesHandler
+
+	// Channels 可选:若注入,则在本地模型命中渠道映射时优先走外置上游渠道,
+	// 未命中(ErrNoRoute)再回退到内置 ChatGPT 账号池。
+	Channels *channel.Router
 
 	// Settings 可选:若注入则在构造上游 client 时应用动态超时。
 	Settings interface {
@@ -184,6 +189,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			fail("rate_limit_rpm")
 			openAIError(c, http.StatusTooManyRequests, "rate_limit_rpm",
 				"触发每分钟请求数限制 (RPM),请稍后再试")
+			return
+		}
+	}
+
+	// 优先走外置渠道。本地模型若配置了渠道映射,直接由适配器调用 OpenAI/Gemini
+	// 兼容接口并按 SSE 返回。handled=true 时已完成响应,直接收尾。
+	if h.Channels != nil {
+		if handled := h.dispatchChatToChannel(c, ak, m, &req, rec, ratio, rpmCap, tpmCap, startAt); handled {
 			return
 		}
 	}
