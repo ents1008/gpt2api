@@ -8,6 +8,10 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/432539/gpt2api/internal/upstream/chatgpt"
 )
 
 // ImportSource 代表一条待导入记录,来自任意一种 JSON 格式。
@@ -17,13 +21,19 @@ type ImportSource struct {
 	Email       string
 
 	// 可选
-	RefreshToken     string
-	SessionToken     string // 从 cookie 里提取的 __Secure-next-auth.session-token
-	ClientID         string
-	ChatGPTAccountID string
-	AccountType      string // codex / chatgpt
-	ExpiredAt        time.Time
-	Name             string // sub2api 里的 name 字段(当 email 缺失时退化为 email)
+	RefreshToken         string
+	SessionToken         string // 从 cookie 里提取的 __Secure-next-auth.session-token
+	ClientID             string
+	RefreshClientID      string
+	CredentialProvenance string
+	BrowserProfile       string // 注册浏览器采集的无凭据 HTTP/时区画像 JSON
+	ChatGPTAccountID     string
+	AccountType          string // codex / chatgpt
+	ExpiredAt            time.Time
+	Name                 string // sub2api 里的 name 字段(当 email 缺失时退化为 email)
+	DeviceID             string // 注册/浏览器侧 oai-did,用于 Oai-Device-Id
+	SessionID            string // 注册/浏览器侧 oai-session-id
+	Cookies              string // JSON cookies,用于重放完整 ChatGPT Web 会话
 }
 
 // ImportLineResult 返回给前端,每条记录处理结果。
@@ -53,6 +63,9 @@ type ImportOptions struct {
 	DefaultClientID string
 	// DefaultProxyID 新建账号时默认绑定的代理 id(0 = 不绑)。
 	DefaultProxyID uint64
+	// Quarantine 将需要独立观察的旧凭据置于隔离期。浏览器注册凭据
+	// 已由真实浏览器建立完整 Web 身份，不使用该生产阻断开关。
+	Quarantine bool
 	// BatchSize 分批 commit 的大小(仅用于让出 CPU,每批做一次 context check)。默认 200。
 	BatchSize int
 }
@@ -165,13 +178,21 @@ func parseSingleJSON(s string) ([]ImportSource, error) {
 		// 同名 camelCase 字段也走 tokenFileB;json tag 都用 snake_case
 		// 这里用一个临时结构
 		var camel struct {
-			AccessToken  string `json:"accessToken"`
-			RefreshToken string `json:"refreshToken"`
-			Email        string `json:"email"`
-			AccountID    string `json:"account_id"`
-			Type         string `json:"type"`
-			ClientID     string `json:"client_id"`
-			Expired      string `json:"expires"`
+			AccessToken          string          `json:"accessToken"`
+			RefreshToken         string          `json:"refreshToken"`
+			Email                string          `json:"email"`
+			AccountID            string          `json:"account_id"`
+			Type                 string          `json:"type"`
+			ClientID             string          `json:"client_id"`
+			RefreshClientID      string          `json:"refresh_client_id"`
+			CredentialProvenance string          `json:"credential_provenance"`
+			BrowserProfile       json.RawMessage `json:"browser_profile"`
+			DeviceID             string          `json:"deviceId"`
+			OAIDeviceID          string          `json:"oaiDeviceId"`
+			SessionID            string          `json:"sessionId"`
+			OAISessionID         string          `json:"oaiSessionId"`
+			Cookies              json.RawMessage `json:"cookies"`
+			Expired              string          `json:"expires"`
 		}
 		if err := json.Unmarshal([]byte(s), &camel); err != nil {
 			return nil, err
@@ -182,6 +203,12 @@ func parseSingleJSON(s string) ([]ImportSource, error) {
 		b.AccountID = camel.AccountID
 		b.Type = camel.Type
 		b.ClientID = camel.ClientID
+		b.RefreshClientID = camel.RefreshClientID
+		b.CredentialProvenance = camel.CredentialProvenance
+		b.BrowserProfile = camel.BrowserProfile
+		b.DeviceID = firstNonEmpty(camel.DeviceID, camel.OAIDeviceID)
+		b.SessionID = firstNonEmpty(camel.SessionID, camel.OAISessionID)
+		b.Cookies = camel.Cookies
 		b.Expired = camel.Expired
 		src, ok := b.toSource()
 		if !ok {
@@ -199,27 +226,49 @@ type subAPIAccount struct {
 	Platform    string `json:"platform"`
 	Type        string `json:"type"`
 	Credentials struct {
-		AccessToken      string `json:"access_token"`
-		RefreshToken     string `json:"refresh_token"`
-		SessionToken     string `json:"session_token"`
-		ClientID         string `json:"client_id"`
-		ChatGPTAccountID string `json:"chatgpt_account_id"`
+		AccessToken          string          `json:"access_token"`
+		RefreshToken         string          `json:"refresh_token"`
+		SessionToken         string          `json:"session_token"`
+		ClientID             string          `json:"client_id"`
+		RefreshClientID      string          `json:"refresh_client_id"`
+		CredentialProvenance string          `json:"credential_provenance"`
+		BrowserProfile       json.RawMessage `json:"browser_profile"`
+		ChatGPTAccountID     string          `json:"chatgpt_account_id"`
+		DeviceID             string          `json:"device_id"`
+		OAIDeviceID          string          `json:"oai_device_id"`
+		SessionID            string          `json:"session_id"`
+		OAISessionID         string          `json:"oai_session_id"`
+		Cookies              json.RawMessage `json:"cookies"`
+		CookieJSON           json.RawMessage `json:"cookie_json"`
 	} `json:"credentials"`
 	Extra struct {
-		Email string `json:"email"`
+		Email      string          `json:"email"`
+		Cookies    json.RawMessage `json:"cookies"`
+		CookieJSON json.RawMessage `json:"cookie_json"`
 	} `json:"extra"`
 }
 
 func (a subAPIAccount) toSource() (ImportSource, bool) {
 	src := ImportSource{
-		AccessToken:      a.Credentials.AccessToken,
-		RefreshToken:     a.Credentials.RefreshToken,
-		SessionToken:     a.Credentials.SessionToken,
-		ClientID:         a.Credentials.ClientID,
-		ChatGPTAccountID: a.Credentials.ChatGPTAccountID,
-		AccountType:      normalizeType(a.Name, a.Platform),
-		Email:            strings.TrimSpace(a.Extra.Email),
-		Name:             a.Name,
+		AccessToken:          a.Credentials.AccessToken,
+		RefreshToken:         a.Credentials.RefreshToken,
+		SessionToken:         a.Credentials.SessionToken,
+		ClientID:             a.Credentials.ClientID,
+		RefreshClientID:      a.Credentials.RefreshClientID,
+		CredentialProvenance: a.Credentials.CredentialProvenance,
+		BrowserProfile:       rawJSONText(a.Credentials.BrowserProfile),
+		ChatGPTAccountID:     a.Credentials.ChatGPTAccountID,
+		AccountType:          normalizeType(a.Name, a.Platform),
+		Email:                strings.TrimSpace(a.Extra.Email),
+		Name:                 a.Name,
+		DeviceID:             firstNonEmpty(a.Credentials.DeviceID, a.Credentials.OAIDeviceID),
+		SessionID:            firstNonEmpty(a.Credentials.SessionID, a.Credentials.OAISessionID),
+		Cookies: firstNonEmpty(
+			rawJSONText(a.Credentials.Cookies),
+			rawJSONText(a.Credentials.CookieJSON),
+			rawJSONText(a.Extra.Cookies),
+			rawJSONText(a.Extra.CookieJSON),
+		),
 	}
 	if src.Email == "" {
 		src.Email = emailFromName(a.Name)
@@ -232,24 +281,41 @@ func (a subAPIAccount) toSource() (ImportSource, bool) {
 
 // tokenFileB 对应 token_xxx.json。
 type tokenFileB struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	IDToken      string `json:"id_token"`
-	AccountID    string `json:"account_id"`
-	Email        string `json:"email"`
-	Type         string `json:"type"`
-	ClientID     string `json:"client_id"`
-	Expired      string `json:"expired"`
+	AccessToken          string          `json:"access_token"`
+	RefreshToken         string          `json:"refresh_token"`
+	SessionToken         string          `json:"session_token"`
+	IDToken              string          `json:"id_token"`
+	AccountID            string          `json:"account_id"`
+	Email                string          `json:"email"`
+	Type                 string          `json:"type"`
+	ClientID             string          `json:"client_id"`
+	RefreshClientID      string          `json:"refresh_client_id"`
+	CredentialProvenance string          `json:"credential_provenance"`
+	BrowserProfile       json.RawMessage `json:"browser_profile"`
+	DeviceID             string          `json:"device_id"`
+	OAIDeviceID          string          `json:"oai_device_id"`
+	SessionID            string          `json:"session_id"`
+	OAISessionID         string          `json:"oai_session_id"`
+	Cookies              json.RawMessage `json:"cookies"`
+	CookieJSON           json.RawMessage `json:"cookie_json"`
+	Expired              string          `json:"expired"`
 }
 
 func (b tokenFileB) toSource() (ImportSource, bool) {
 	src := ImportSource{
-		AccessToken:      b.AccessToken,
-		RefreshToken:     b.RefreshToken,
-		Email:            strings.TrimSpace(b.Email),
-		ChatGPTAccountID: b.AccountID,
-		ClientID:         b.ClientID,
-		AccountType:      strings.ToLower(strings.TrimSpace(b.Type)),
+		AccessToken:          b.AccessToken,
+		RefreshToken:         b.RefreshToken,
+		SessionToken:         b.SessionToken,
+		Email:                strings.TrimSpace(b.Email),
+		ChatGPTAccountID:     b.AccountID,
+		ClientID:             b.ClientID,
+		RefreshClientID:      b.RefreshClientID,
+		CredentialProvenance: b.CredentialProvenance,
+		BrowserProfile:       rawJSONText(b.BrowserProfile),
+		AccountType:          strings.ToLower(strings.TrimSpace(b.Type)),
+		DeviceID:             firstNonEmpty(b.DeviceID, b.OAIDeviceID),
+		SessionID:            firstNonEmpty(b.SessionID, b.OAISessionID),
+		Cookies:              firstNonEmpty(rawJSONText(b.Cookies), rawJSONText(b.CookieJSON)),
 	}
 	if src.AccountType == "" {
 		src.AccountType = "codex"
@@ -297,6 +363,27 @@ func normalizeType(name, platform string) string {
 	default:
 		return "codex"
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func rawJSONText(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return strings.TrimSpace(s)
+	}
+	return trimmed
 }
 
 // ImportBatch 执行批量导入。
@@ -371,6 +458,50 @@ func (s *Service) importOne(ctx context.Context, idx int, it ImportSource, opt I
 		out.Reason = "缺少 access_token"
 		return out
 	}
+	completeBrowserIdentity := it.SessionToken != "" && it.DeviceID != "" && it.Cookies != "" && it.BrowserProfile != ""
+	if it.CredentialProvenance == CredentialProvenanceBrowserWeb {
+		if !completeBrowserIdentity || it.RefreshToken != "" || it.RefreshClientID != "" {
+			out.Status = "failed"
+			out.Reason = "Browser Web 导入要求完整且单一的浏览器会话、设备身份和 Cookies"
+			return out
+		}
+	} else if opt.Quarantine {
+		validCredentialShape := false
+		switch {
+		case isImmutableQuarantinedWebCredential(
+			it.CredentialProvenance,
+			AdmissionStateQuarantined,
+		):
+			validCredentialShape = it.RefreshToken == "" && it.RefreshClientID == ""
+		case it.CredentialProvenance == CredentialProvenanceDual:
+			validCredentialShape = it.RefreshToken != "" && it.RefreshClientID != ""
+		}
+		if !completeBrowserIdentity || !validCredentialShape {
+			out.Status = "failed"
+			out.Reason = "隔离准入要求来源明确的 Web 会话、浏览器状态和设备身份"
+			return out
+		}
+	}
+	if it.Cookies != "" {
+		normalized, err := normalizeAccountCookies(it.Cookies)
+		if err != nil {
+			out.Status = "failed"
+			out.Reason = err.Error()
+			return out
+		}
+		it.Cookies = normalized
+	}
+	if it.BrowserProfile == "" {
+		it.BrowserProfile = chatgpt.DefaultBrowserProfileJSON()
+	} else {
+		_, normalized, err := chatgpt.ParseBrowserProfileJSON(it.BrowserProfile)
+		if err != nil {
+			out.Status = "failed"
+			out.Reason = "浏览器画像无效:" + err.Error()
+			return out
+		}
+		it.BrowserProfile = normalized
+	}
 
 	// 计算过期时间:优先用 JSON 的 expired,其次解析 JWT
 	expAt := it.ExpiredAt
@@ -414,17 +545,28 @@ func (s *Service) importOne(ctx context.Context, idx int, it ImportSource, opt I
 	}
 
 	if existing == nil {
+		if it.SessionID == "" {
+			it.SessionID = uuid.NewString()
+		}
 		// 新建
 		a := &Account{
-			Email:            it.Email,
-			AuthTokenEnc:     atEnc,
-			ClientID:         clientID,
-			ChatGPTAccountID: it.ChatGPTAccountID,
-			AccountType:      accountType,
-			PlanType:         "free",
-			DailyImageQuota:  100,
-			Status:           StatusHealthy,
+			Email:                it.Email,
+			AuthTokenEnc:         atEnc,
+			ClientID:             clientID,
+			RefreshClientID:      it.RefreshClientID,
+			CredentialProvenance: it.CredentialProvenance,
+			BrowserProfile:       it.BrowserProfile,
+			ChatGPTAccountID:     it.ChatGPTAccountID,
+			AccountType:          accountType,
+			OAISessionID:         it.SessionID,
+			OAIDeviceID:          it.DeviceID,
+			PlanType:             "free",
+			DailyImageQuota:      100,
+			Status:               StatusHealthy,
+			AdmissionState:       AdmissionStateAdmitted,
+			AdmissionStage:       AdmissionStageAdmitted,
 		}
+		applyImportedAdmissionState(a, it.CredentialProvenance, opt.Quarantine, time.Now())
 		if rtEnc != "" {
 			a.RefreshTokenEnc.String = rtEnc
 			a.RefreshTokenEnc.Valid = true
@@ -442,6 +584,13 @@ func (s *Service) importOne(ctx context.Context, idx int, it ImportSource, opt I
 			out.Status = "failed"
 			out.Reason = "入库失败:" + err.Error()
 			return out
+		}
+		if it.Cookies != "" {
+			if err := s.upsertImportedCookies(ctx, id, it.Cookies); err != nil {
+				out.Status = "failed"
+				out.Reason = "Cookies 入库失败:" + err.Error()
+				return out
+			}
 		}
 		if opt.DefaultProxyID > 0 {
 			_ = s.dao.SetBinding(ctx, id, opt.DefaultProxyID)
@@ -471,11 +620,28 @@ func (s *Service) importOne(ctx context.Context, idx int, it ImportSource, opt I
 	if clientID != "" {
 		existing.ClientID = clientID
 	}
+	if it.RefreshClientID != "" {
+		existing.RefreshClientID = it.RefreshClientID
+	}
+	if it.CredentialProvenance != "" {
+		existing.CredentialProvenance = it.CredentialProvenance
+	}
+	if it.BrowserProfile != "" {
+		existing.BrowserProfile = it.BrowserProfile
+	}
 	if it.ChatGPTAccountID != "" {
 		existing.ChatGPTAccountID = it.ChatGPTAccountID
 	}
 	if accountType != "" {
 		existing.AccountType = accountType
+	}
+	if it.SessionID != "" {
+		existing.OAISessionID = it.SessionID
+	} else if existing.OAISessionID == "" {
+		existing.OAISessionID = uuid.NewString()
+	}
+	if it.DeviceID != "" {
+		existing.OAIDeviceID = it.DeviceID
 	}
 	if !expAt.IsZero() {
 		existing.TokenExpiresAt.Time = expAt
@@ -485,12 +651,37 @@ func (s *Service) importOne(ctx context.Context, idx int, it ImportSource, opt I
 	if existing.Status == StatusDead || existing.Status == StatusSuspicious {
 		existing.Status = StatusHealthy
 	}
+	applyImportedAdmissionState(existing, it.CredentialProvenance, opt.Quarantine, time.Now())
 	if err := s.dao.Update(ctx, existing); err != nil {
 		out.Status = "failed"
 		out.Reason = "更新失败:" + err.Error()
 		return out
 	}
+	if it.Cookies != "" {
+		if err := s.upsertImportedCookies(ctx, existing.ID, it.Cookies); err != nil {
+			out.Status = "failed"
+			out.Reason = "Cookies 更新失败:" + err.Error()
+			return out
+		}
+	}
 	out.Status = "updated"
 	out.ID = existing.ID
 	return out
+}
+
+func applyImportedAdmissionState(a *Account, provenance string, quarantine bool, now time.Time) {
+	if provenance == CredentialProvenanceBrowserWeb {
+		applyAdmissionTransition(a, admissionTransition{
+			State: AdmissionStateAdmitted,
+			Stage: AdmissionStageAdmitted,
+		})
+		return
+	}
+	if quarantine {
+		applyAdmissionTransition(a, newAdmissionObservation(now))
+	}
+}
+
+func (s *Service) upsertImportedCookies(ctx context.Context, accountID uint64, cookies string) error {
+	return s.StoreCookies(ctx, accountID, cookies)
 }

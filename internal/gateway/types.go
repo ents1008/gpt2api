@@ -2,6 +2,10 @@ package gateway
 
 import "github.com/432539/gpt2api/internal/upstream/chatgpt"
 
+type ChatReasoningRequest struct {
+	Effort string `json:"effort,omitempty" binding:"omitempty,oneof=low medium high"`
+}
+
 // ChatCompletionsRequest 对应 OpenAI /v1/chat/completions 请求体子集。
 type ChatCompletionsRequest struct {
 	Model       string                 `json:"model" binding:"required"`
@@ -11,6 +15,7 @@ type ChatCompletionsRequest struct {
 	TopP        float64                `json:"top_p,omitempty"`
 	MaxTokens   int                    `json:"max_tokens,omitempty"`
 	User        string                 `json:"user,omitempty"`
+	Reasoning   *ChatReasoningRequest  `json:"reasoning,omitempty"`
 	Extra       map[string]interface{} `json:"-"`
 }
 

@@ -3,16 +3,18 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { storeToRefs } from 'pinia'
 import { useUserStore } from '@/stores/user'
-import { formatCredit } from '@/utils/format'
+import { formatCredit, formatImageTaskError } from '@/utils/format'
 import {
   getMyImageTask,
   listMyImageTasks,
   listMyModels,
+  playEditImage,
   streamPlayChat,
   playGenerateImage,
   type ImageTask,
   type SimpleModel,
   type PlayChatMessage,
+  type PlayChatReasoningEffort,
   type PlayImageData,
 } from '@/api/me'
 import { ENABLE_CHAT_MODEL } from '@/config/feature'
@@ -85,6 +87,7 @@ let uid = 0
 
 const systemPrompt = ref('你是一个友好、博学、回答精准的中文助手。回答中若涉及代码请使用 Markdown 代码块。')
 const temperature = ref(0.7)
+const reasoningEffort = ref<PlayChatReasoningEffort>('high')
 const chatInput = ref('')
 const chatMsgs = ref<UIMessage[]>([])
 const chatSending = ref(false)
@@ -144,7 +147,12 @@ async function sendChat() {
   chatAbort.value = new AbortController()
   try {
     await streamPlayChat(
-      { model: selectedChatModel.value, messages: history, temperature: temperature.value },
+      {
+        model: selectedChatModel.value,
+        messages: history,
+        temperature: temperature.value,
+        reasoning: { effort: reasoningEffort.value },
+      },
       (delta) => {
         assistant.content += delta
         assistant.pending = false
@@ -259,7 +267,7 @@ function renderMarkdown(raw: string): string {
 // 文生图(Text2Img)
 // ====================================================
 
-// 10 档比例:对应上游 chatgpt.com 实际靠 prompt 第一行 "Make the aspect ratio X:Y , "
+// 10 档比例:服务端实际靠 prompt 第一行 "Make the aspect ratio X:Y , "
 // 控制画面比例。OpenAI 兼容 size 仅作占位,按宽高比就近映射到官方支持的三档。
 interface RatioOpt {
   label: string      // 中文名:方形 / 宽屏 / 竖版 …
@@ -399,7 +407,7 @@ async function recoverImageTask(
       const matched = findRecentTask(list.items || [], meta, startedAt)
       if (matched) {
         if (matched.status === 'success') return mapTaskImages(matched)
-        if (matched.status === 'failed') throw new Error(matched.error || '图片生成失败')
+        if (matched.status === 'failed') throw new Error(formatImageTaskError(matched.error))
         taskID = matched.task_id
       }
     }
@@ -407,7 +415,7 @@ async function recoverImageTask(
     if (taskID) {
       const task = await getMyImageTask(taskID)
       if (task.status === 'success') return mapTaskImages(task)
-      if (task.status === 'failed') throw new Error(task.error || '图片生成失败')
+      if (task.status === 'failed') throw new Error(formatImageTaskError(task.error))
     }
 
     await sleep(2500, signal)
@@ -463,12 +471,14 @@ async function sendText2Img() {
           ElMessage.success(`生成成功,共 ${t2iResult.value.length} 张`)
         }
       } catch (recoverErr: unknown) {
-        const msg = recoverErr instanceof Error ? recoverErr.message : String(recoverErr)
+        const msg = formatImageTaskError(
+          recoverErr instanceof Error ? recoverErr.message : String(recoverErr),
+        )
         t2iError.value = msg
         ElMessage.error(msg)
       }
     } else {
-      const msg = err instanceof Error ? err.message : String(err)
+      const msg = formatImageTaskError(err instanceof Error ? err.message : String(err))
       t2iError.value = msg
       ElMessage.error(msg)
     }
@@ -548,6 +558,20 @@ function removeRefImage(idx: number) {
   refImages.value.splice(idx, 1)
 }
 
+function dataURLToFile(dataUrl: string, filename: string, fallbackMime: string) {
+  const parts = dataUrl.split(',', 2)
+  if (parts.length !== 2) {
+    throw new Error('参考图数据格式错误')
+  }
+  const mime = /^data:([^;,]+)/.exec(parts[0])?.[1] || fallbackMime
+  const binary = atob(parts[1])
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+  return new File([bytes], filename, { type: mime })
+}
+
 async function sendImg2Img() {
   if (refImages.value.length === 0) {
     ElMessage.warning('请先上传至少一张参考图')
@@ -567,16 +591,19 @@ async function sendImg2Img() {
   i2iAbort.value = new AbortController()
   const startedAt = Date.now()
   try {
-    const resp = await playGenerateImage(
+    const files = refImages.value.map((r, idx) =>
+      dataURLToFile(r.dataUrl, r.name || `ref-${idx + 1}.png`, 'image/png'),
+    )
+    const resp = await playEditImage(
+      selectedImageModel.value,
+      i2iPrompt.value.trim(),
+      files,
       {
-        model: selectedImageModel.value,
-        prompt: i2iPrompt.value.trim(),
         n: 1,
         size: i2iSize.value,
-        reference_images: refImages.value.map((r) => r.dataUrl),
         upscale: i2iUpscale.value || undefined,
+        signal: i2iAbort.value.signal,
       },
-      i2iAbort.value.signal,
     )
     i2iResult.value = resp.data || []
     if (i2iResult.value.length > 0) {
@@ -597,12 +624,14 @@ async function sendImg2Img() {
           ElMessage.success(`生成成功,共 ${i2iResult.value.length} 张`)
         }
       } catch (recoverErr: unknown) {
-        const msg = recoverErr instanceof Error ? recoverErr.message : String(recoverErr)
+        const msg = formatImageTaskError(
+          recoverErr instanceof Error ? recoverErr.message : String(recoverErr),
+        )
         i2iError.value = msg
         ElMessage.error(msg)
       }
     } else {
-      const msg = err instanceof Error ? err.message : String(err)
+      const msg = formatImageTaskError(err instanceof Error ? err.message : String(err))
       i2iError.value = msg
       ElMessage.error(msg)
     }
@@ -695,6 +724,16 @@ watch(activeTab, (v) => {
               </label>
               <el-slider v-model="temperature" :min="0" :max="2" :step="0.1" show-stops />
               <div class="side-hint">越低越保守、越高越发散。默认 0.7</div>
+            </div>
+
+            <div class="side-row">
+              <label class="side-lbl">推理强度</label>
+              <el-radio-group v-model="reasoningEffort" size="small" class="upscale-group">
+                <el-radio-button label="low">低</el-radio-button>
+                <el-radio-button label="medium">中</el-radio-button>
+                <el-radio-button label="high">高</el-radio-button>
+              </el-radio-group>
+              <div class="side-hint">Web 会把该值透传为 <code class="hint-code">reasoning.effort</code></div>
             </div>
 
             <div class="side-row">
@@ -872,7 +911,7 @@ watch(activeTab, (v) => {
               </div>
               <div class="side-hint">
                 选中后会把 <code class="hint-code">Make the aspect ratio {{ t2iRatio }} ,</code>
-                作为 prompt 第一行传给上游
+                作为 prompt 第一行传给服务端
               </div>
             </div>
 
@@ -896,7 +935,7 @@ watch(activeTab, (v) => {
                 <el-tooltip placement="top" effect="light">
                   <template #content>
                     <div style="max-width:260px;line-height:1.55;">
-                      上游原生出图为 1024 或 1792 px;选择 2K/4K 会在图片加载时用本地
+                      原生出图为 1024 或 1792 px;选择 2K/4K 会在图片加载时用本地
                       <b>Catmull-Rom 插值</b>放大并以 PNG 输出。<br>
                       <span style="color:#a16207;">注意:这是传统算法放大,不是 AI 超分,</span>不会补出新的纹理或毛发,只会让画面更大更平滑。4K 首次加载约 +0.5~1.5s,之后命中缓存。
                     </div>
@@ -952,7 +991,7 @@ watch(activeTab, (v) => {
             <div v-if="t2iSending" class="stage loading">
               <div class="orb"><el-icon class="spin"><Loading /></el-icon></div>
               <div class="stage-title">正在为你绘制…</div>
-              <div class="stage-sub">上游渲染通常需要 1-2 分钟,请保持页面打开</div>
+              <div class="stage-sub">图片渲染通常需要 1-2 分钟,请保持页面打开</div>
             </div>
             <div v-else-if="t2iError" class="err-block">
               <el-icon><WarningFilled /></el-icon>
@@ -1055,7 +1094,7 @@ watch(activeTab, (v) => {
                 <el-tooltip placement="top" effect="light">
                   <template #content>
                     <div style="max-width:260px;line-height:1.55;">
-                      上游原生出图为 1024 或 1792 px;选择 2K/4K 会在图片加载时用本地
+                      原生出图为 1024 或 1792 px;选择 2K/4K 会在图片加载时用本地
                       <b>Catmull-Rom 插值</b>放大并以 PNG 输出。<br>
                       <span style="color:#a16207;">注意:这是传统算法放大,不是 AI 超分,</span>不会补出新的纹理或毛发,只会让画面更大更平滑。4K 首次加载约 +0.5~1.5s,之后命中缓存。
                     </div>

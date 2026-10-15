@@ -12,6 +12,7 @@
 
 - **仓库地址**:<https://github.com/432539/gpt2api>
 - **技术交流 QQ 群**:`382446`(入群请注明「gpt2api」)
+- **生产图片排障**:[日志、请求关联、账号调度、代理与关键源码 Runbook](docs/PRODUCTION_IMAGE_RUNBOOK.md)
 
 ---
 
@@ -38,6 +39,7 @@
 - [十四、参与贡献](#十四参与贡献)
 - [十五、免责声明与风险提示](#十五免责声明与风险提示)
 - [十六、License](#十六license)
+- [生产图片链路排障手册](docs/PRODUCTION_IMAGE_RUNBOOK.md)
 
 ---
 
@@ -648,6 +650,8 @@ gpt2api/
 ├── configs/                    # 配置示例
 ├── deploy/                     # Docker / compose / entrypoint / nginx
 ├── docs/                       # 补充文档
+│   ├── FRAMEWORK.md              # 产品与框架开发说明
+│   └── PRODUCTION_IMAGE_RUNBOOK.md # 生产图片链路日志、关联与排障入口
 ├── internal/                   # 后端核心(所有业务代码,Go 风格私有包)
 │   ├── account/                  # 账号池:导入 / 刷新 / 探测 / DAO
 │   ├── apikey/                   # 下游 Key

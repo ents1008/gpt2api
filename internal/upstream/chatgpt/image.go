@@ -2,7 +2,7 @@
 //
 // 完整链路(和文字聊天共用 f/conversation,只通过 system_hints=["picture_v2"] 区分):
 //
-//  0. (可选) GET /                              → 拿 oai-did cookie
+//  0. (可选) HEAD /                             → 拿 oai-did cookie
 //  1. POST /backend-api/f/conversation/prepare      → conduit_token
 //  2. POST /backend-api/sentinel/chat-requirements → chat_token + 可选 POW 挑战
 //  3. POST /backend-api/f/conversation (SSE)         → 边解析边收 file-service://
@@ -26,10 +26,12 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 )
 
 // ImageConvOpts 是图像会话的入参。
@@ -41,8 +43,10 @@ type ImageConvOpts struct {
 	MessageID      string          // 可选,留空自动生成
 	ChatToken      string          // 必传,来自 ChatRequirements
 	ProofToken     string          // 可选
+	TurnstileToken string          // 可选,来自 ChatRequirementsV2
+	SOToken        string          // 可选,来自 requirements finalize
 	ConduitToken   string          // 可选,来自 PrepareFConversation
-	TimezoneOffset int             // 默认 -480(Asia/Shanghai)
+	TimezoneOffset int             // 留空时使用账号浏览器时区的当前偏移
 	SSETimeout     time.Duration   // 默认 120s
 	References     []*UploadedFile // 图生图/编辑:已上传的参考图,会插到 prompt 前面
 }
@@ -58,7 +62,7 @@ func (c *Client) InitConversation(ctx context.Context, systemHints ...string) er
 		"gizmo_id":                nil,
 		"requested_default_model": nil,
 		"conversation_id":         nil,
-		"timezone_offset_min":     -480,
+		"timezone_offset_min":     c.profile.TimezoneOffsetMinutes(time.Now()),
 		"system_hints":            systemHints,
 	}
 	body, _ := json.Marshal(payload)
@@ -106,8 +110,8 @@ func (c *Client) PrepareFConversation(ctx context.Context, opt ImageConvOpts) (s
 		"parent_message_id":     opt.ParentMsgID,
 		"model":                 opt.UpstreamModel,
 		"client_prepare_state":  "success",
-		"timezone_offset_min":   -480,
-		"timezone":              "Asia/Shanghai",
+		"timezone_offset_min":   c.profile.TimezoneOffsetMinutes(time.Now()),
+		"timezone":              c.profile.Timezone,
 		"conversation_mode":     map[string]string{"kind": "primary_assistant"},
 		"system_hints":          []string{"picture_v2"},
 		"partial_query": map[string]interface{}{
@@ -143,6 +147,12 @@ func (c *Client) PrepareFConversation(ctx context.Context, opt ImageConvOpts) (s
 	if opt.ProofToken != "" {
 		req.Header.Set("Openai-Sentinel-Proof-Token", opt.ProofToken)
 	}
+	if opt.TurnstileToken != "" {
+		req.Header.Set("Openai-Sentinel-Turnstile-Token", opt.TurnstileToken)
+	}
+	if opt.SOToken != "" {
+		req.Header.Set("OpenAI-Sentinel-SO-Token", opt.SOToken)
+	}
 
 	res, err := c.hc.Do(req)
 	if err != nil {
@@ -176,7 +186,7 @@ func (c *Client) StreamFConversation(ctx context.Context, opt ImageConvOpts) (<-
 		opt.ParentMsgID = uuid.NewString()
 	}
 	if opt.TimezoneOffset == 0 {
-		opt.TimezoneOffset = -480
+		opt.TimezoneOffset = c.profile.TimezoneOffsetMinutes(time.Now())
 	}
 	if opt.SSETimeout == 0 {
 		opt.SSETimeout = 180 * time.Second
@@ -237,7 +247,7 @@ func (c *Client) StreamFConversation(ctx context.Context, opt ImageConvOpts) (<-
 		"model":                    opt.UpstreamModel,
 		"client_prepare_state":     "sent",
 		"timezone_offset_min":      opt.TimezoneOffset,
-		"timezone":                 "Asia/Shanghai",
+		"timezone":                 c.profile.Timezone,
 		"conversation_mode":        map[string]string{"kind": "primary_assistant"},
 		"enable_message_followups": true,
 		"system_hints":             []string{"picture_v2"},
@@ -277,6 +287,12 @@ func (c *Client) StreamFConversation(ctx context.Context, opt ImageConvOpts) (<-
 	if opt.ProofToken != "" {
 		req.Header.Set("Openai-Sentinel-Proof-Token", opt.ProofToken)
 	}
+	if opt.TurnstileToken != "" {
+		req.Header.Set("Openai-Sentinel-Turnstile-Token", opt.TurnstileToken)
+	}
+	if opt.SOToken != "" {
+		req.Header.Set("OpenAI-Sentinel-SO-Token", opt.SOToken)
+	}
 	if opt.ConduitToken != "" {
 		req.Header.Set("X-Conduit-Token", opt.ConduitToken)
 	}
@@ -291,7 +307,19 @@ func (c *Client) StreamFConversation(ctx context.Context, opt ImageConvOpts) (<-
 	if res.StatusCode >= 400 {
 		buf, _ := io.ReadAll(res.Body)
 		res.Body.Close()
-		return nil, &UpstreamError{Status: res.StatusCode, Message: "f/conversation failed", Body: string(buf)}
+		if l := loggerL(); l != nil {
+			l.Error("chatgpt StreamFConversation rejected",
+				zap.Int("status", res.StatusCode),
+				zap.String("body", string(buf)),
+				zap.String("cf_ray", res.Header.Get("cf-ray")),
+				zap.String("content_type", res.Header.Get("Content-Type")),
+			)
+		}
+		return nil, &UpstreamError{
+			Status:  res.StatusCode,
+			Message: fmt.Sprintf("f/conversation failed (status %d): %s", res.StatusCode, strings.TrimSpace(string(buf))),
+			Body:    string(buf),
+		}
 	}
 	out := make(chan SSEEvent, 64)
 	go parseSSE(res.Body, out, opt.SSETimeout)
@@ -305,70 +333,294 @@ type ImageSSEResult struct {
 	SedimentIDs    []string // sediment:// 引用(通常是预览,需要轮询)
 	FinishType     string   // finish_details.type(interrupted/stop/...)
 	ImageGenTaskID string
+	ToolInvoked    bool
+	TurnUseCase    string
+	SawHandoff     bool
+	AssistantText  string
+	TimedOut       bool
+	Termination    string
+	ReadFailure    SSEReadFailureClass
 }
+
+const (
+	ImageSSETerminationStreamClosed = "stream_closed"
+	ImageSSETerminationStreamError  = "stream_error"
+	ImageSSETerminationDone         = "done"
+	ImageSSETerminationReady        = "ready"
+	ImageSSETerminationPollable     = "pollable"
+	ImageSSETerminationTimeout      = "timeout"
+)
 
 var (
 	reFileRef = regexp.MustCompile(`file-service://([A-Za-z0-9_-]+)`)
 	reSedRef  = regexp.MustCompile(`sediment://([A-Za-z0-9_-]+)`)
 )
 
+type ImageSSEParseOpts struct {
+	ExpectedN          int
+	ReturnWhenPollable bool
+	MaxWait            time.Duration
+}
+
+func (r ImageSSEResult) ShouldPollForImage() bool {
+	if r.ConversationID == "" {
+		return false
+	}
+	return r.ImageGenTaskID != "" ||
+		r.ToolInvoked ||
+		r.TurnUseCase == "image gen" ||
+		r.SawHandoff
+}
+
+// HasStartedImageTask reports concrete image output work, not merely an image
+// turn intent. Intent-only metadata is still useful for entering conversation
+// polling, but must not hide a terminal assistant response during that poll.
+func (r ImageSSEResult) HasStartedImageTask() bool {
+	return r.ImageGenTaskID != "" || len(r.FileIDs) > 0 || len(r.SedimentIDs) > 0
+}
+
 // ParseImageSSE 消费 SSE 事件流,把图像相关的字段提取出来。
 // 调用方可以根据返回的 FileIDs 判断是否已灰度直出。
 func ParseImageSSE(stream <-chan SSEEvent) ImageSSEResult {
+	return ParseImageSSEUntilReady(stream, ImageSSEParseOpts{})
+}
+
+func ParseImageSSEUntilReady(stream <-chan SSEEvent, opt ImageSSEParseOpts) ImageSSEResult {
 	var r ImageSSEResult
 	seenFile := map[string]struct{}{}
 	seenSed := map[string]struct{}{}
 
-	for ev := range stream {
-		if ev.Err != nil {
-			return r
-		}
-		data := ev.Data
-		if len(data) == 0 {
-			continue
-		}
-		if string(data) == "[DONE]" {
-			return r
-		}
-		// 文本正则先扫一遍(比 JSON 解析更健壮)
-		for _, m := range reFileRef.FindAllSubmatch(data, -1) {
-			fid := string(m[1])
-			if _, ok := seenFile[fid]; !ok {
-				seenFile[fid] = struct{}{}
-				r.FileIDs = append(r.FileIDs, fid)
-			}
-		}
-		for _, m := range reSedRef.FindAllSubmatch(data, -1) {
-			sid := string(m[1])
-			if _, ok := seenSed[sid]; !ok {
-				seenSed[sid] = struct{}{}
-				r.SedimentIDs = append(r.SedimentIDs, sid)
-			}
-		}
+	var timeout <-chan time.Time
+	var timer *time.Timer
+	if opt.MaxWait > 0 {
+		timer = time.NewTimer(opt.MaxWait)
+		defer timer.Stop()
+		timeout = timer.C
+	}
 
-		var obj map[string]interface{}
-		if err := json.Unmarshal(data, &obj); err != nil {
-			continue
-		}
-		if v, ok := obj["v"].(map[string]interface{}); ok {
-			if cid, ok := v["conversation_id"].(string); ok && cid != "" && r.ConversationID == "" {
-				r.ConversationID = cid
+	for {
+		select {
+		case ev, ok := <-stream:
+			if !ok {
+				r.Termination = ImageSSETerminationStreamClosed
+				return r
 			}
-			if msg, ok := v["message"].(map[string]interface{}); ok {
-				if meta, ok := msg["metadata"].(map[string]interface{}); ok {
-					if tid, ok := meta["image_gen_task_id"].(string); ok {
-						r.ImageGenTaskID = tid
-					}
-					if fd, ok := meta["finish_details"].(map[string]interface{}); ok {
-						if ft, ok := fd["type"].(string); ok {
-							r.FinishType = ft
-						}
-					}
+			if ev.Err != nil {
+				r.Termination = ImageSSETerminationStreamError
+				r.ReadFailure = ev.ReadFailure
+				if r.ReadFailure == "" {
+					r.ReadFailure = SSEReadFailureOtherIO
+				}
+				return r
+			}
+			data := ev.Data
+			if len(data) == 0 {
+				continue
+			}
+			if string(data) == "[DONE]" {
+				r.Termination = ImageSSETerminationDone
+				return r
+			}
+
+			updateImageSSEResult(&r, data, seenFile, seenSed)
+			if opt.ExpectedN > 0 && len(r.FileIDs)+len(r.SedimentIDs) >= opt.ExpectedN {
+				r.Termination = ImageSSETerminationReady
+				return r
+			}
+			if opt.ReturnWhenPollable && r.ShouldPollForImage() {
+				r.Termination = ImageSSETerminationPollable
+				return r
+			}
+		case <-timeout:
+			r.TimedOut = true
+			r.Termination = ImageSSETerminationTimeout
+			return r
+		}
+	}
+}
+
+func updateImageSSEResult(r *ImageSSEResult, data []byte, seenFile, seenSed map[string]struct{}) {
+	var obj map[string]interface{}
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return
+	}
+	if cid, _ := obj["conversation_id"].(string); cid != "" && r.ConversationID == "" {
+		r.ConversationID = cid
+	}
+	switch typ, _ := obj["type"].(string); typ {
+	case "stream_handoff":
+		r.SawHandoff = true
+	case "server_ste_metadata":
+		if meta, _ := obj["metadata"].(map[string]interface{}); meta != nil {
+			if invoked, ok := meta["tool_invoked"].(bool); ok {
+				r.ToolInvoked = invoked
+			}
+			if useCase, _ := meta["turn_use_case"].(string); useCase != "" {
+				r.TurnUseCase = useCase
+			}
+		}
+	}
+
+	if v, ok := obj["v"].(map[string]interface{}); ok {
+		if cid, ok := v["conversation_id"].(string); ok && cid != "" && r.ConversationID == "" {
+			r.ConversationID = cid
+		}
+	}
+
+	msg := imageSSEMessage(obj)
+	if msg != nil {
+		if text := assistantTextFromSSEMessage(msg); text != "" {
+			r.AssistantText = text
+		}
+		if meta, ok := msg["metadata"].(map[string]interface{}); ok {
+			if tid, ok := meta["image_gen_task_id"].(string); ok {
+				r.ImageGenTaskID = tid
+			}
+			if fd, ok := meta["finish_details"].(map[string]interface{}); ok {
+				if ft, ok := fd["type"].(string); ok {
+					r.FinishType = ft
 				}
 			}
 		}
 	}
-	return r
+
+	isPatchEvent := obj["o"] == "patch"
+	isUserMsg := isUserMessageSSEEvent(obj)
+	imageContext := isImageOutputSSEMessage(msg) ||
+		(r.ToolInvoked && !isUserMsg) ||
+		(isPatchEvent && !isUserMsg && hasImageAssetPointerInText(string(data)))
+	if !imageContext {
+		return
+	}
+
+	addUniqueRefs(data, reFileRef, seenFile, func(id string) {
+		r.FileIDs = append(r.FileIDs, id)
+	})
+	addUniqueRefs(data, reSedRef, seenSed, func(id string) {
+		r.SedimentIDs = append(r.SedimentIDs, id)
+	})
+}
+
+func assistantTextFromSSEMessage(msg map[string]interface{}) string {
+	if msg == nil {
+		return ""
+	}
+	author, _ := msg["author"].(map[string]interface{})
+	if strings.TrimSpace(strings.ToLower(toString(author["role"]))) != "assistant" {
+		return ""
+	}
+	content, _ := msg["content"].(map[string]interface{})
+	if content == nil || toString(content["content_type"]) != "text" {
+		return ""
+	}
+	return strings.TrimSpace(collectTextParts(content["parts"]))
+}
+
+func imageSSEMessage(event map[string]interface{}) map[string]interface{} {
+	if msg, ok := event["message"].(map[string]interface{}); ok {
+		return msg
+	}
+	if v, ok := event["v"].(map[string]interface{}); ok {
+		if msg, ok := v["message"].(map[string]interface{}); ok {
+			return msg
+		}
+	}
+	return nil
+}
+
+func isUserMessageSSEEvent(event map[string]interface{}) bool {
+	msg := imageSSEMessage(event)
+	if msg == nil {
+		return false
+	}
+	author, _ := msg["author"].(map[string]interface{})
+	role, _ := author["role"].(string)
+	return strings.TrimSpace(strings.ToLower(role)) == "user"
+}
+
+func isImageOutputSSEMessage(msg map[string]interface{}) bool {
+	if msg == nil {
+		return false
+	}
+	author, _ := msg["author"].(map[string]interface{})
+	role := strings.TrimSpace(strings.ToLower(toString(author["role"])))
+	if role != "tool" && role != "assistant" {
+		return false
+	}
+	meta, _ := msg["metadata"].(map[string]interface{})
+	content, _ := msg["content"].(map[string]interface{})
+	if toString(meta["async_task_type"]) == "image_gen" {
+		return true
+	}
+	return hasImageAssetPointer(content) || hasImageAssetPointer(meta)
+}
+
+func addUniqueRefs(raw []byte, re *regexp.Regexp, seen map[string]struct{}, add func(string)) {
+	for _, m := range re.FindAllSubmatch(raw, -1) {
+		id := string(m[1])
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		add(id)
+	}
+}
+
+func hasImageAssetPointerInText(text string) bool {
+	return strings.Contains(text, "asset_pointer") ||
+		strings.Contains(text, "file-service://") ||
+		strings.Contains(text, "sediment://")
+}
+
+func hasImageAssetPointer(v interface{}) bool {
+	switch x := v.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.HasPrefix(x, "file-service://") ||
+			strings.HasPrefix(x, "sediment://") ||
+			strings.Contains(x, "file-service://") ||
+			strings.Contains(x, "sediment://")
+	case []interface{}:
+		for _, item := range x {
+			if hasImageAssetPointer(item) {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		if asset := toString(x["asset_pointer"]); strings.HasPrefix(asset, "file-service://") || strings.HasPrefix(asset, "sediment://") {
+			return true
+		}
+		for _, item := range x {
+			if hasImageAssetPointer(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func imageRefsFromValue(v interface{}, re *regexp.Regexp) []string {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]struct{}{}
+	for _, m := range re.FindAllSubmatch(raw, -1) {
+		id := string(m[1])
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func toString(v interface{}) string {
+	s, _ := v.(string)
+	return s
 }
 
 // ImageToolMsg 是 conversation.mapping 里一条 IMG2 tool 消息的关键字段。
@@ -402,6 +654,82 @@ type AssistantTextReply struct {
 	CreateTime float64
 	Recipient  string
 	Text       string
+}
+
+// ConversationSummary is the bounded identity/time projection returned by the
+// recent-conversation endpoint. Message content remains owned by
+// GetConversationMapping and is not duplicated into this list contract.
+type ConversationSummary struct {
+	ID string
+}
+
+func (summary *ConversationSummary) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		ID             string `json:"id"`
+		ConversationID string `json:"conversation_id"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	summary.ID = strings.TrimSpace(raw.ID)
+	if summary.ID == "" {
+		summary.ID = strings.TrimSpace(raw.ConversationID)
+	}
+	return nil
+}
+
+// ListRecentConversations returns the most recently updated conversation
+// summaries without mutating or starting a conversation.
+func (c *Client) ListRecentConversations(
+	ctx context.Context,
+	limit int,
+) ([]ConversationSummary, error) {
+	if limit < 1 || limit > 20 {
+		return nil, fmt.Errorf("conversation limit must be between 1 and 20")
+	}
+	endpoint, err := url.Parse(c.opts.BaseURL + "/backend-api/conversations")
+	if err != nil {
+		return nil, err
+	}
+	query := endpoint.Query()
+	query.Set("offset", "0")
+	query.Set("limit", strconv.Itoa(limit))
+	query.Set("order", "updated")
+	query.Set("conversation_filter", "all")
+	endpoint.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	c.commonHeaders(req)
+	req.Header.Set("Accept", "application/json")
+
+	res, err := c.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	buf, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode >= 400 {
+		return nil, &UpstreamError{
+			Status: res.StatusCode, Message: "conversations list failed", Body: string(buf),
+		}
+	}
+	var out struct {
+		Items         []ConversationSummary `json:"items"`
+		Conversations []ConversationSummary `json:"conversations"`
+	}
+	if err := json.Unmarshal(buf, &out); err != nil {
+		return nil, fmt.Errorf("decode conversations list: %w", err)
+	}
+	if out.Items != nil {
+		return out.Items, nil
+	}
+	return out.Conversations, nil
 }
 
 // GetConversationMapping 读取会话全量 mapping(轮询用)。
@@ -448,16 +776,16 @@ func ExtractImageToolMsgs(mapping map[string]interface{}) []ImageToolMsg {
 		author, _ := msg["author"].(map[string]interface{})
 		meta, _ := msg["metadata"].(map[string]interface{})
 		content, _ := msg["content"].(map[string]interface{})
-		if author == nil || meta == nil || content == nil {
+		if author == nil {
 			continue
 		}
-		if s, _ := author["role"].(string); s != "tool" {
+		role := strings.TrimSpace(strings.ToLower(toString(author["role"])))
+		if role != "tool" && role != "assistant" {
 			continue
 		}
-		if s, _ := meta["async_task_type"].(string); s != "image_gen" {
-			continue
-		}
-		if s, _ := content["content_type"].(string); s != "multimodal_text" {
+		isImageGen := meta != nil && toString(meta["async_task_type"]) == "image_gen"
+		hasAsset := hasImageAssetPointer(content) || hasImageAssetPointer(meta)
+		if !isImageGen && !hasAsset {
 			continue
 		}
 
@@ -478,32 +806,33 @@ func ExtractImageToolMsgs(mapping map[string]interface{}) []ImageToolMsg {
 			tm.ImageGenTitle = v
 		}
 
-		parts, _ := content["parts"].([]interface{})
 		seenF := map[string]struct{}{}
 		seenS := map[string]struct{}{}
-		extractAsset := func(text string) {
-			for _, m := range reFileRef.FindAllStringSubmatch(text, -1) {
-				if _, ok := seenF[m[1]]; !ok {
-					seenF[m[1]] = struct{}{}
-					tm.FileIDs = append(tm.FileIDs, m[1])
-				}
+		appendFile := func(id string) {
+			if _, ok := seenF[id]; ok {
+				return
 			}
-			for _, m := range reSedRef.FindAllStringSubmatch(text, -1) {
-				if _, ok := seenS[m[1]]; !ok {
-					seenS[m[1]] = struct{}{}
-					tm.SedimentIDs = append(tm.SedimentIDs, m[1])
-				}
-			}
+			seenF[id] = struct{}{}
+			tm.FileIDs = append(tm.FileIDs, id)
 		}
-		for _, p := range parts {
-			switch v := p.(type) {
-			case map[string]interface{}:
-				if aid, _ := v["asset_pointer"].(string); aid != "" {
-					extractAsset(aid)
-				}
-			case string:
-				extractAsset(v)
+		appendSed := func(id string) {
+			if _, ok := seenS[id]; ok {
+				return
 			}
+			seenS[id] = struct{}{}
+			tm.SedimentIDs = append(tm.SedimentIDs, id)
+		}
+		for _, id := range imageRefsFromValue(content, reFileRef) {
+			appendFile(id)
+		}
+		for _, id := range imageRefsFromValue(meta, reFileRef) {
+			appendFile(id)
+		}
+		for _, id := range imageRefsFromValue(content, reSedRef) {
+			appendSed(id)
+		}
+		for _, id := range imageRefsFromValue(meta, reSedRef) {
+			appendSed(id)
 		}
 		out = append(out, tm)
 	}
@@ -570,7 +899,7 @@ func ExtractImageErrorMsgs(mapping map[string]interface{}) []ImageErrorMsg {
 		if em.AsyncTaskType != "image_gen" && !em.IsError && !em.Hidden {
 			continue
 		}
-		if isContentPolicyText(em.Text) {
+		if IsContentPolicyText(em.Text) {
 			em.ErrorType = "content_policy"
 		} else {
 			em.ErrorType = "async_error"
@@ -679,15 +1008,65 @@ func collectTextParts(raw interface{}) string {
 	return strings.Join(text, "\n")
 }
 
-func isContentPolicyText(text string) bool {
+// IsContentPolicyText 识别上游生图内容政策、安全围栏、风控违规等拒绝文案。
+func IsContentPolicyText(text string) bool {
 	s := strings.ToLower(strings.TrimSpace(text))
 	if s == "" {
 		return false
 	}
-	return strings.Contains(s, "内容政策") ||
-		strings.Contains(s, "content policy") ||
+
+	// 中文特征
+	if strings.Contains(s, "内容政策") ||
+		strings.Contains(s, "内容安全") ||
+		strings.Contains(s, "安全策略") ||
+		strings.Contains(s, "安全系统") ||
+		strings.Contains(s, "安全准则") ||
+		strings.Contains(s, "安全规范") ||
+		strings.Contains(s, "违反政策") ||
+		strings.Contains(s, "违反策略") ||
+		strings.Contains(s, "违背政策") ||
+		strings.Contains(s, "违规") {
+		return true
+	}
+
+	// 英文政策与围栏特征 (支持 policy / policies / guidelines / guardrails / scam)
+	if strings.Contains(s, "content policy") ||
+		strings.Contains(s, "content policies") ||
+		strings.Contains(s, "content polic") ||
 		strings.Contains(s, "safety policy") ||
-		strings.Contains(s, "policy violation")
+		strings.Contains(s, "safety policies") ||
+		strings.Contains(s, "safety polic") ||
+		strings.Contains(s, "usage policy") ||
+		strings.Contains(s, "usage policies") ||
+		strings.Contains(s, "safety system") ||
+		strings.Contains(s, "safety guidelines") ||
+		strings.Contains(s, "policy violation") ||
+		strings.Contains(s, "policies violation") ||
+		strings.Contains(s, "guardrail") ||
+		strings.Contains(s, "fraudulent or scam") {
+		return true
+	}
+
+	// 组合判定: 包含 violate / violation 并且涉及 policy / policies / terms / guidelines / guardrails
+	if (strings.Contains(s, "violate") || strings.Contains(s, "violat") || strings.Contains(s, "violation")) &&
+		(strings.Contains(s, "polic") || strings.Contains(s, "guardrail") || strings.Contains(s, "guideline") || strings.Contains(s, "safety") || strings.Contains(s, "term")) {
+		return true
+	}
+
+	return false
+}
+
+func isImageToolArgumentText(text string) bool {
+	s := strings.ToLower(strings.TrimSpace(text))
+	if s == "" {
+		return false
+	}
+	if strings.Contains(s, `"referenced_image_ids"`) {
+		return true
+	}
+	return strings.Contains(s, `"prompt"`) &&
+		strings.Contains(s, `"size"`) &&
+		strings.Contains(s, `"n"`)
 }
 
 // PollOpts 控制 PollConversationForImages 的等待策略。
@@ -698,10 +1077,11 @@ func isContentPolicyText(text string) bool {
 //   - 没够数继续轮询,到 MaxWait 仍有至少 1 张也算成功(速度优先)
 //   - 全程没拿到图才是 timeout
 type PollOpts struct {
-	BaselineToolIDs map[string]struct{} // 发送前已存在的 tool 消息 id,本次回合只看新增
-	ExpectedN       int                 // 期望返回的图片张数,够了立即短路,默认 1
-	MaxWait         time.Duration       // 总超时,默认 5m
-	Interval        time.Duration       // 轮询间隔,默认 3s
+	BaselineToolIDs  map[string]struct{} // 发送前已存在的 tool 消息 id,本次回合只看新增
+	ExpectedN        int                 // 期望返回的图片张数,够了立即短路,默认 1
+	MaxWait          time.Duration       // 总超时,默认 2m
+	Interval         time.Duration       // 轮询间隔,默认 3s
+	ImageTaskStarted bool                // SSE 已返回 image_gen_task_id/图片引用时,assistant 文本不视为终态
 }
 
 // PollStatus 是 PollConversationForImages 的结果状态。
@@ -735,15 +1115,24 @@ type PollDebug struct {
 	LastError               string
 }
 
+const (
+	maxConsecutiveConversationPollErrors = 3
+	maxStartedImageTaskEmptyPollWait     = 2 * time.Minute
+	backendTasksPollTimeout              = 5 * time.Second
+)
+
 func normalizePollOpts(opt PollOpts) PollOpts {
 	if opt.ExpectedN <= 0 {
 		opt.ExpectedN = 1
 	}
 	if opt.MaxWait <= 0 {
-		opt.MaxWait = 5 * time.Minute
+		opt.MaxWait = 2 * time.Minute
 	}
 	if opt.Interval <= 0 {
 		opt.Interval = 3 * time.Second
+	}
+	if opt.ImageTaskStarted && opt.MaxWait > maxStartedImageTaskEmptyPollWait {
+		opt.MaxWait = maxStartedImageTaskEmptyPollWait
 	}
 	return opt
 }
@@ -766,6 +1155,7 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 		seenFile       = map[string]struct{}{}
 		seenSed        = map[string]struct{}{}
 		consecutive429 int
+		consecutiveErr int
 	)
 
 	for time.Now().Before(deadline) {
@@ -775,6 +1165,22 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 			dbg.LastError = ctx.Err().Error()
 			return PollStatusError, nil, nil, dbg
 		default:
+		}
+
+		if taskErr := c.pollBackendTaskError(ctx, convID, deadline); taskErr != nil {
+			if opt.ImageTaskStarted && isImageToolArgumentText(taskErr.Text) {
+				// ChatGPT can store the image tool argument JSON as an
+				// assistant metadata.is_error task row while the real image is
+				// still delivered later through conversation tool messages.
+				// Treat only that shape as non-terminal; real policy errors
+				// still fail fast below.
+			} else {
+				dbg.ErrorMessages = 1
+				dbg.AsyncErrorType = taskErr.ErrorType
+				dbg.AsyncErrorText = taskErr.Text
+				dbg.AsyncErrorMessageID = taskErr.MessageID
+				return PollStatusRejected, nil, nil, dbg
+			}
 		}
 
 		mapping, err := c.getMappingRaw(ctx, convID)
@@ -790,10 +1196,15 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 				sleep(ctx, 10*time.Second)
 				continue
 			}
+			consecutiveErr++
+			if consecutiveErr >= maxConsecutiveConversationPollErrors {
+				return PollStatusError, nil, nil, dbg
+			}
 			sleep(ctx, opt.Interval)
 			continue
 		}
 		consecutive429 = 0
+		consecutiveErr = 0
 
 		msgs := ExtractImageToolMsgs(mapping)
 		dbg.ToolMessages = len(msgs)
@@ -807,10 +1218,10 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 		}
 		replyMsgs := ExtractAssistantTextReplies(mapping)
 		dbg.AssistantReplies = len(replyMsgs)
-		if len(msgs) == 0 {
-			if bestReply := pickBestAssistantTextReply(replyMsgs); bestReply != nil {
-				dbg.AssistantReplyText = bestReply.Text
-				dbg.AssistantReplyMessageID = bestReply.MessageID
+		if bestReply := pickBestAssistantTextReply(replyMsgs); bestReply != nil {
+			dbg.AssistantReplyText = bestReply.Text
+			dbg.AssistantReplyMessageID = bestReply.MessageID
+			if len(msgs) == 0 && !opt.ImageTaskStarted {
 				return PollStatusRejected, nil, nil, dbg
 			}
 		}
@@ -864,6 +1275,94 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 		return PollStatusSuccess, allFile, allSed, dbg
 	}
 	return PollStatusTimeout, nil, nil, dbg
+}
+
+func (c *Client) pollBackendTaskError(ctx context.Context, convID string, deadline time.Time) *ImageErrorMsg {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return nil
+	}
+	timeout := backendTasksPollTimeout
+	if remaining < timeout {
+		timeout = remaining
+	}
+	tasks, err := c.queryBackendTasks(ctx, convID, timeout)
+	if err != nil {
+		return nil
+	}
+	errMsgs := ExtractImageErrorMsgs(tasksToImageErrorMapping(tasks))
+	return pickBestImageError(errMsgs)
+}
+
+type backendTask struct {
+	TaskID                 string                 `json:"task_id"`
+	ConversationID         string                 `json:"conversation_id"`
+	OriginalConversationID string                 `json:"original_conversation_id"`
+	ImageGenMessage        map[string]interface{} `json:"image_gen_message"`
+}
+
+func (c *Client) queryBackendTasks(ctx context.Context, convID string, timeout time.Duration) ([]backendTask, error) {
+	if timeout <= 0 {
+		return nil, nil
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet,
+		c.opts.BaseURL+"/backend-api/tasks", nil)
+	if err != nil {
+		return nil, err
+	}
+	c.commonHeaders(req)
+	req.Header.Set("Accept", "application/json")
+
+	res, err := c.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	buf, _ := io.ReadAll(res.Body)
+	if res.StatusCode >= 400 {
+		return nil, &UpstreamError{Status: res.StatusCode, Message: "tasks get failed", Body: string(buf)}
+	}
+
+	var out struct {
+		Tasks []backendTask `json:"tasks"`
+	}
+	if err := json.Unmarshal(buf, &out); err != nil {
+		return nil, fmt.Errorf("decode tasks: %w", err)
+	}
+	if convID == "" {
+		return out.Tasks, nil
+	}
+	filtered := make([]backendTask, 0, len(out.Tasks))
+	for _, task := range out.Tasks {
+		if task.ConversationID == convID || task.OriginalConversationID == convID {
+			filtered = append(filtered, task)
+		}
+	}
+	return filtered, nil
+}
+
+func tasksToImageErrorMapping(tasks []backendTask) map[string]interface{} {
+	mapping := make(map[string]interface{}, len(tasks))
+	for idx, task := range tasks {
+		if len(task.ImageGenMessage) == 0 {
+			continue
+		}
+		messageID, _ := task.ImageGenMessage["id"].(string)
+		if messageID == "" {
+			messageID = task.TaskID
+		}
+		if messageID == "" {
+			messageID = fmt.Sprintf("task_%d", idx)
+		}
+		mapping[messageID] = map[string]interface{}{
+			"message": task.ImageGenMessage,
+		}
+	}
+	return mapping
 }
 
 // getMappingRaw 拉 conversation 并返回 mapping。
@@ -939,14 +1438,16 @@ func (c *Client) ImageDownloadURL(ctx context.Context, convID, fileRef string) (
 	return out.DownloadURL, nil
 }
 
-// FetchImage 下载指定 URL 的图片字节(调用 ImageDownloadURL 返回的签名 URL)。
+// FetchImage 通过无代理 client 下载指定 URL 的图片字节(调用 ImageDownloadURL
+// 返回的签名 URL)。图片原始字节不得消耗账号控制代理流量。
 // 返回 (bytes, content_type)。超过 maxBytes 的响应会被截断报错。
 //
 // 鉴权策略:
 //   - files.oaiusercontent.com / cdn.oaistatic.com 等**预签名直链**:不带 Authorization,
 //     它们依赖 URL 自带的 sig 参数鉴权;带 Bearer 反而会被某些 CDN 因"双鉴权"400。
-//   - chatgpt.com/backend-api/estuary/... (sediment 回源 URL):**必须** 带 Authorization:
-//     Bearer 和完整 Oai-* 头,否则上游 403。这就是 IMG2 sediment 图 502 的根因。
+//   - chatgpt.com/backend-api/estuary/... (sediment 回源 URL):必须带 Bearer,
+//     但不需要 Cookie/Oai-* 账号身份头。该大图 GET 使用独立无代理 uTLS client,
+//     控制请求仍保持账号绑定代理与浏览器身份。
 func (c *Client) FetchImage(ctx context.Context, signedURL string, maxBytes int64) ([]byte, string, error) {
 	if maxBytes <= 0 {
 		maxBytes = 16 * 1024 * 1024 // 16MB 默认
@@ -956,17 +1457,27 @@ func (c *Client) FetchImage(ctx context.Context, signedURL string, maxBytes int6
 		return nil, "", err
 	}
 
-	// 判断是否需要完整 chatgpt 鉴权头:以 BaseURL(通常 https://chatgpt.com)开头的
-	// estuary / attachment 回源 URL 必须带 Bearer + Oai-* 头;外部 CDN 直链不带。
+	// 以 BaseURL(通常 https://chatgpt.com)开头的 estuary 回源 URL 只需 Bearer;
+	// 外部 CDN 直链依赖 URL 自带签名,不带任何账号凭据。
 	needAuth := strings.HasPrefix(signedURL, c.opts.BaseURL+"/")
 	if needAuth {
-		c.commonHeaders(req)
-		req.Header.Set("Accept", "image/*,*/*;q=0.8")
+		ApplyBrowserFingerprintHeaders(req.Header, c.profile)
+		req.Header.Set("Authorization", "Bearer "+c.opts.AuthToken)
+		req.Header.Set("Origin", c.opts.BaseURL)
+		req.Header.Set("Referer", c.opts.BaseURL+"/")
+		req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+		req.Header.Set("Sec-Fetch-Dest", "image")
+		req.Header.Set("Sec-Fetch-Mode", "no-cors")
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
 	} else {
-		req.Header.Set("User-Agent", c.opts.UserAgent)
+		req.Header.Set("User-Agent", DefaultUserAgent)
 	}
 
-	res, err := c.hc.Do(req)
+	downloadClient := c.assetHC
+	if needAuth {
+		downloadClient = c.bearerAssetHC
+	}
+	res, err := downloadClient.Do(req)
 	if err != nil {
 		return nil, "", err
 	}
@@ -981,6 +1492,9 @@ func (c *Client) FetchImage(ctx context.Context, signedURL string, maxBytes int6
 	}
 	if int64(len(body)) > maxBytes {
 		return nil, ct, fmt.Errorf("image exceeds max bytes (%d)", maxBytes)
+	}
+	if c.opts.TrafficMeter != nil {
+		c.opts.TrafficMeter.directAssetReadBytes.Add(int64(len(body)))
 	}
 	return body, ct, nil
 }

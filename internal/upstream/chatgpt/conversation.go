@@ -22,13 +22,16 @@ type ChatMessage struct {
 
 // ConversationOpts 是 StreamConversation 的参数。
 type ConversationOpts struct {
-	Model         string        // 上游模型 slug(如 auto / gpt-4o / o4-mini)
-	Messages      []ChatMessage // OpenAI 风格消息
-	ParentMsgID   string        // 可选,为空自动生成
-	ConvID        string        // 可选,为空则新会话
-	ProofToken    string        // 可选,POW 解出后填入
-	ChatToken     string        // 必传(来自 ChatRequirements)
-	ReadTimeout   time.Duration // SSE 读超时(单次事件间隔),默认 60s
+	Model          string        // 上游模型 slug(如 auto / gpt-4o / o4-mini)
+	Messages       []ChatMessage // OpenAI 风格消息
+	ParentMsgID    string        // 可选,为空自动生成
+	ConvID         string        // 可选,为空则新会话
+	ProofToken     string        // 可选,POW 解出后填入
+	TurnstileToken string        // 可选,来自 ChatRequirementsV2
+	ChatToken      string        // 必传(来自 ChatRequirements)
+	ReadTimeout    time.Duration // SSE 读超时(单次事件间隔),默认 60s
+	ForceParagen   bool          // 仅在显式诊断/灰度协议验证时开启
+	ParagenModel   string        // 搭配 force_paragen 使用的模型 slug
 }
 
 // conversationPayload 对齐 chatgpt.com 请求体(文本模式)。
@@ -52,11 +55,11 @@ type conversationPayload struct {
 }
 
 type upstreamMsg struct {
-	ID       string            `json:"id"`
-	Author   upstreamAuthor    `json:"author"`
-	Content  upstreamContent   `json:"content"`
-	Metadata map[string]any    `json:"metadata,omitempty"`
-	CreateTime float64 `json:"create_time,omitempty"`
+	ID         string          `json:"id"`
+	Author     upstreamAuthor  `json:"author"`
+	Content    upstreamContent `json:"content"`
+	Metadata   map[string]any  `json:"metadata,omitempty"`
+	CreateTime float64         `json:"create_time,omitempty"`
 }
 
 type upstreamAuthor struct {
@@ -89,16 +92,18 @@ func (c *Client) StreamConversation(ctx context.Context, opt ConversationOpts) (
 		Model:                      opt.Model,
 		ParentMessageID:            opt.ParentMsgID,
 		ConversationID:             opt.ConvID,
-		TimezoneOffsetMin:          -480, // UTC+8
+		TimezoneOffsetMin:          c.profile.TimezoneOffsetMinutes(time.Now()),
 		HistoryAndTrainingDisabled: false,
 		ConversationMode:           map[string]interface{}{"kind": "primary_assistant"},
 		WebsocketRequestID:         uuid.NewString(),
+		ForceParagen:               opt.ForceParagen,
+		ForceParagenModelSlug:      opt.ParagenModel,
 	}
 	for _, m := range opt.Messages {
 		payload.Messages = append(payload.Messages, upstreamMsg{
-			ID:      uuid.NewString(),
-			Author:  upstreamAuthor{Role: m.Role},
-			Content: upstreamContent{ContentType: "text", Parts: []string{m.Content}},
+			ID:         uuid.NewString(),
+			Author:     upstreamAuthor{Role: m.Role},
+			Content:    upstreamContent{ContentType: "text", Parts: []string{m.Content}},
 			CreateTime: float64(time.Now().Unix()),
 		})
 	}
@@ -117,6 +122,9 @@ func (c *Client) StreamConversation(ctx context.Context, opt ConversationOpts) (
 	req.Header.Set("Openai-Sentinel-Chat-Requirements-Token", opt.ChatToken)
 	if opt.ProofToken != "" {
 		req.Header.Set("Openai-Sentinel-Proof-Token", opt.ProofToken)
+	}
+	if opt.TurnstileToken != "" {
+		req.Header.Set("Openai-Sentinel-Turnstile-Token", opt.TurnstileToken)
 	}
 
 	// 对 SSE 请求取消客户端整体 timeout,改为 per-event 读超时控制。
@@ -140,10 +148,11 @@ func (c *Client) StreamConversation(ctx context.Context, opt ConversationOpts) (
 
 // parseSSE 读取 SSE 流,把每个 data: 事件推入 channel。
 // chatgpt.com 的事件格式:
-//   event: delta\n
-//   data: {"p":"...","o":"append","v":"..."}\n\n
 //
-//   data: [DONE]\n\n
+//	event: delta\n
+//	data: {"p":"...","o":"append","v":"..."}\n\n
+//
+//	data: [DONE]\n\n
 func parseSSE(r io.ReadCloser, out chan<- SSEEvent, _ time.Duration) {
 	defer r.Close()
 	defer close(out)
@@ -167,7 +176,10 @@ func parseSSE(r io.ReadCloser, out chan<- SSEEvent, _ time.Duration) {
 		line, err := rd.ReadString('\n')
 		if err != nil {
 			if err != io.EOF {
-				out <- SSEEvent{Err: fmt.Errorf("sse read: %w", err)}
+				out <- SSEEvent{
+					Err:         fmt.Errorf("sse read: %w", err),
+					ReadFailure: classifySSEReadFailure(err),
+				}
 			} else {
 				flush()
 			}
@@ -200,4 +212,27 @@ func parseSSE(r io.ReadCloser, out chan<- SSEEvent, _ time.Duration) {
 		}
 		// 其他行忽略
 	}
+}
+
+type SSEReadFailureClass string
+
+const (
+	SSEReadFailureUnexpectedEOF    SSEReadFailureClass = "unexpected_eof"
+	SSEReadFailureTimeout          SSEReadFailureClass = "read_timeout"
+	SSEReadFailureContextCancelled SSEReadFailureClass = "context_cancelled"
+	SSEReadFailureOtherIO          SSEReadFailureClass = "other_io"
+)
+
+func classifySSEReadFailure(err error) SSEReadFailureClass {
+	switch {
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return SSEReadFailureUnexpectedEOF
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return SSEReadFailureContextCancelled
+	}
+	var networkError interface{ Timeout() bool }
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return SSEReadFailureTimeout
+	}
+	return SSEReadFailureOtherIO
 }

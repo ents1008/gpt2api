@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/432539/gpt2api/internal/upstream/chatgpt"
 	"github.com/432539/gpt2api/pkg/crypto"
 )
 
@@ -23,45 +25,65 @@ func NewService(dao *DAO, cipher *crypto.AESGCM) *Service {
 
 // CreateInput 新增账号入参(明文敏感字段)。
 type CreateInput struct {
-	Email            string    `json:"email"`
-	AuthToken        string    `json:"auth_token"`
-	RefreshToken     string    `json:"refresh_token"`
-	SessionToken     string    `json:"session_token"`
-	TokenExpiresAt   time.Time `json:"token_expires_at"`
-	OAISessionID     string    `json:"oai_session_id"`
-	OAIDeviceID      string    `json:"oai_device_id"`
-	ClientID         string    `json:"client_id"`
-	ChatGPTAccountID string    `json:"chatgpt_account_id"`
-	AccountType      string    `json:"account_type"`
-	PlanType         string    `json:"plan_type"`
-	DailyImageQuota  int       `json:"daily_image_quota"`
-	Notes            string    `json:"notes"`
-	Cookies          string    `json:"cookies"`
-	ProxyID          uint64    `json:"proxy_id"` // 可选:立即绑定
+	Email                string    `json:"email"`
+	AuthToken            string    `json:"auth_token"`
+	RefreshToken         string    `json:"refresh_token"`
+	SessionToken         string    `json:"session_token"`
+	TokenExpiresAt       time.Time `json:"token_expires_at"`
+	OAISessionID         string    `json:"oai_session_id"`
+	OAIDeviceID          string    `json:"oai_device_id"`
+	ClientID             string    `json:"client_id"`
+	RefreshClientID      string    `json:"refresh_client_id"`
+	CredentialProvenance string    `json:"credential_provenance"`
+	BrowserProfile       string    `json:"browser_profile"`
+	ChatGPTAccountID     string    `json:"chatgpt_account_id"`
+	AccountType          string    `json:"account_type"`
+	PlanType             string    `json:"plan_type"`
+	DailyImageQuota      int       `json:"daily_image_quota"`
+	Notes                string    `json:"notes"`
+	Cookies              string    `json:"cookies"`
+	ProxyID              uint64    `json:"proxy_id"` // 可选:立即绑定
 }
 
 // UpdateInput 更新入参。AuthToken/RefreshToken/SessionToken/Cookies 为空串表示不改。
 type UpdateInput struct {
-	Email            string    `json:"email"`
-	AuthToken        string    `json:"auth_token"`
-	RefreshToken     string    `json:"refresh_token"`
-	SessionToken     string    `json:"session_token"`
-	TokenExpiresAt   time.Time `json:"token_expires_at"`
-	OAISessionID     string    `json:"oai_session_id"`
-	OAIDeviceID      string    `json:"oai_device_id"`
-	ClientID         string    `json:"client_id"`
-	ChatGPTAccountID string    `json:"chatgpt_account_id"`
-	AccountType      string    `json:"account_type"`
-	PlanType         string    `json:"plan_type"`
-	DailyImageQuota  int       `json:"daily_image_quota"`
-	Status           string    `json:"status"`
-	Notes            string    `json:"notes"`
-	Cookies          string    `json:"cookies"`
+	Email                string    `json:"email"`
+	AuthToken            string    `json:"auth_token"`
+	RefreshToken         string    `json:"refresh_token"`
+	SessionToken         string    `json:"session_token"`
+	TokenExpiresAt       time.Time `json:"token_expires_at"`
+	OAISessionID         string    `json:"oai_session_id"`
+	OAIDeviceID          string    `json:"oai_device_id"`
+	ClientID             string    `json:"client_id"`
+	RefreshClientID      string    `json:"refresh_client_id"`
+	CredentialProvenance string    `json:"credential_provenance"`
+	BrowserProfile       string    `json:"browser_profile"`
+	ChatGPTAccountID     string    `json:"chatgpt_account_id"`
+	AccountType          string    `json:"account_type"`
+	PlanType             string    `json:"plan_type"`
+	DailyImageQuota      int       `json:"daily_image_quota"`
+	Status               string    `json:"status"`
+	Notes                string    `json:"notes"`
+	Cookies              string    `json:"cookies"`
 }
 
 func (s *Service) Create(ctx context.Context, in CreateInput) (*Account, error) {
 	if in.Email == "" || in.AuthToken == "" {
 		return nil, errors.New("email 和 auth_token 不能为空")
+	}
+	if in.Cookies != "" {
+		normalized, err := normalizeAccountCookies(in.Cookies)
+		if err != nil {
+			return nil, err
+		}
+		in.Cookies = normalized
+	}
+	if in.BrowserProfile == "" {
+		in.BrowserProfile = chatgpt.DefaultBrowserProfileJSON()
+	} else if _, normalized, err := chatgpt.ParseBrowserProfileJSON(in.BrowserProfile); err != nil {
+		return nil, err
+	} else {
+		in.BrowserProfile = normalized
 	}
 	atEnc, err := s.cipher.EncryptString(in.AuthToken)
 	if err != nil {
@@ -85,6 +107,9 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Account, error) 
 	if in.OAIDeviceID == "" {
 		in.OAIDeviceID = uuid.NewString()
 	}
+	if in.OAISessionID == "" {
+		in.OAISessionID = uuid.NewString()
+	}
 	if in.PlanType == "" {
 		in.PlanType = "plus"
 	}
@@ -100,9 +125,13 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Account, error) 
 	a := &Account{
 		Email: in.Email, AuthTokenEnc: atEnc, RefreshTokenEnc: rtEnc, SessionTokenEnc: stEnc,
 		OAISessionID: in.OAISessionID, OAIDeviceID: in.OAIDeviceID,
-		ClientID: in.ClientID, ChatGPTAccountID: in.ChatGPTAccountID, AccountType: in.AccountType,
+		ClientID: in.ClientID, RefreshClientID: in.RefreshClientID,
+		CredentialProvenance: in.CredentialProvenance,
+		BrowserProfile:       in.BrowserProfile,
+		ChatGPTAccountID:     in.ChatGPTAccountID, AccountType: in.AccountType,
 		PlanType: in.PlanType, DailyImageQuota: in.DailyImageQuota,
-		Status: StatusHealthy, Notes: in.Notes,
+		Status: StatusHealthy, AdmissionState: AdmissionStateAdmitted,
+		AdmissionStage: AdmissionStageAdmitted, Notes: in.Notes,
 	}
 	if !in.TokenExpiresAt.IsZero() {
 		a.TokenExpiresAt = sql.NullTime{Time: in.TokenExpiresAt, Valid: true}
@@ -118,11 +147,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Account, error) 
 	}
 	a.ID = id
 	if in.Cookies != "" {
-		enc, err := s.cipher.EncryptString(in.Cookies)
-		if err != nil {
-			return nil, err
-		}
-		if err := s.dao.UpsertCookies(ctx, id, enc); err != nil {
+		if err := s.StoreCookies(ctx, id, in.Cookies); err != nil {
 			return nil, err
 		}
 	}
@@ -135,6 +160,20 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Account, error) 
 }
 
 func (s *Service) Update(ctx context.Context, id uint64, in UpdateInput) (*Account, error) {
+	if in.Cookies != "" {
+		normalized, err := normalizeAccountCookies(in.Cookies)
+		if err != nil {
+			return nil, err
+		}
+		in.Cookies = normalized
+	}
+	if in.BrowserProfile != "" {
+		_, normalized, err := chatgpt.ParseBrowserProfileJSON(in.BrowserProfile)
+		if err != nil {
+			return nil, err
+		}
+		in.BrowserProfile = normalized
+	}
 	a, err := s.dao.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
@@ -179,6 +218,15 @@ func (s *Service) Update(ctx context.Context, id uint64, in UpdateInput) (*Accou
 	if in.ClientID != "" {
 		a.ClientID = in.ClientID
 	}
+	if in.RefreshClientID != "" {
+		a.RefreshClientID = in.RefreshClientID
+	}
+	if in.CredentialProvenance != "" {
+		a.CredentialProvenance = in.CredentialProvenance
+	}
+	if in.BrowserProfile != "" {
+		a.BrowserProfile = in.BrowserProfile
+	}
 	if in.ChatGPTAccountID != "" {
 		a.ChatGPTAccountID = in.ChatGPTAccountID
 	}
@@ -199,11 +247,7 @@ func (s *Service) Update(ctx context.Context, id uint64, in UpdateInput) (*Accou
 		return nil, err
 	}
 	if in.Cookies != "" {
-		enc, err := s.cipher.EncryptString(in.Cookies)
-		if err != nil {
-			return nil, err
-		}
-		if err := s.dao.UpsertCookies(ctx, id, enc); err != nil {
+		if err := s.StoreCookies(ctx, id, in.Cookies); err != nil {
 			return nil, err
 		}
 	}
@@ -287,6 +331,29 @@ func (s *Service) DecryptCookies(ctx context.Context, accountID uint64) (string,
 		return "", nil
 	}
 	return s.cipher.DecryptString(enc)
+}
+
+// StoreCookies validates and canonicalizes a ChatGPT cookie snapshot before
+// encrypting it. Import and runtime Set-Cookie persistence share this boundary
+// so malformed plaintext cannot be stored and silently ignored later.
+func (s *Service) StoreCookies(ctx context.Context, accountID uint64, raw string) error {
+	normalized, err := normalizeAccountCookies(raw)
+	if err != nil {
+		return err
+	}
+	enc, err := s.cipher.EncryptString(normalized)
+	if err != nil {
+		return err
+	}
+	return s.dao.UpsertCookies(ctx, accountID, enc)
+}
+
+func normalizeAccountCookies(raw string) (string, error) {
+	normalized, err := chatgpt.NormalizeCookieJSON(raw, chatgpt.BaseURL)
+	if err != nil {
+		return "", fmt.Errorf("Cookies 格式错误: %w", err)
+	}
+	return normalized, nil
 }
 
 // GetBinding 查账号-代理绑定。

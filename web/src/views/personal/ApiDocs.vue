@@ -11,7 +11,7 @@ import {
   type ImageTask,
   type MyStatsResp,
 } from '@/api/me'
-import { formatCredit, formatDateTime, formatErrorCode } from '@/utils/format'
+import { formatCredit, formatDateTime, formatErrorCode, formatImageTaskError } from '@/utils/format'
 import { ENABLE_CHAT_MODEL } from '@/config/feature'
 
 const activeTab = ref<'chat' | 'image'>(ENABLE_CHAT_MODEL ? 'chat' : 'image')
@@ -365,7 +365,9 @@ onMounted(async () => {
                     <span class="mute">{{ formatDateTime(t.created_at) }}</span>
                     <span class="credit">{{ formatCredit(t.credit_cost) }} 积分</span>
                   </div>
-                  <div v-if="t.error" class="err">{{ t.error }}</div>
+                  <div v-if="t.error" class="err" :title="t.error">
+                    {{ formatImageTaskError(t.error) }}
+                  </div>
                 </div>
               </el-card>
             </div>

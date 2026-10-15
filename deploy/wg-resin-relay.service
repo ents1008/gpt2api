@@ -1,0 +1,22 @@
+[Unit]
+Description=WireGuard-only relay to the local Resin IPv6 proxy pool
+After=network-online.target wg-quick@wg0.service docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=WG_MGMT_BIND=10.66.67.1
+Environment=WG_MGMT_TARGET_HOST=127.0.0.1
+Environment=WG_MGMT_PORTS=19120:2260
+ExecStart=/usr/bin/python3 /opt/wg-mgmt-proxy/wg_mgmt_proxy.py
+Restart=always
+RestartSec=2
+DynamicUser=true
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/opt/wg-mgmt-proxy
+
+[Install]
+WantedBy=multi-user.target

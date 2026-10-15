@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"strconv"
 	"strings"
@@ -24,18 +25,24 @@ type ProxyURLResolver interface {
 type Handler struct {
 	svc           *Service
 	refresher     *Refresher
-	prober        *QuotaProber
+	quotaProber   QuotaProbeRunner
 	settings      *settings.Service
 	proxyResolver ProxyURLResolver
 }
 
 func NewHandler(s *Service) *Handler { return &Handler{svc: s} }
 
+// QuotaProbeRunner 抽象额度探测执行器,便于 handler 保持 HTTP 编排职责。
+type QuotaProbeRunner interface {
+	ProbeByID(ctx context.Context, id uint64) (*QuotaResult, error)
+	ProbeAllActive(ctx context.Context, limit int) ([]*QuotaResult, error)
+}
+
 // SetRefresher 注入刷新器(可选,未注入时相关接口返回 501)。
 func (h *Handler) SetRefresher(r *Refresher) { h.refresher = r }
 
-// SetProber 注入额度探测器(可选)。
-func (h *Handler) SetProber(p *QuotaProber) { h.prober = p }
+// SetQuotaProber 注入额度探测器(可选,未注入时相关接口返回 500)。
+func (h *Handler) SetQuotaProber(q QuotaProbeRunner) { h.quotaProber = q }
 
 // SetSettings 注入系统设置服务,用于自动刷新开关的读写。
 func (h *Handler) SetSettings(s *settings.Service) { h.settings = s }
@@ -257,7 +264,7 @@ func (h *Handler) UnbindProxy(c *gin.Context) {
 // ===================== 批量导入 =====================
 
 // POST /api/admin/accounts/import
-// body: { text: "...", update_existing: true, default_client_id: "", default_proxy_id: 0 }
+// body: { text: "...", update_existing: true, default_client_id: "", default_proxy_id: 0, quarantine: false }
 // 或 multipart/form-data:files[] + 其他字段
 func (h *Handler) Import(c *gin.Context) {
 	var req struct {
@@ -265,6 +272,7 @@ func (h *Handler) Import(c *gin.Context) {
 		UpdateExisting  *bool  `json:"update_existing"`
 		DefaultClientID string `json:"default_client_id"`
 		DefaultProxyID  uint64 `json:"default_proxy_id"`
+		Quarantine      bool   `json:"quarantine"`
 	}
 	// 支持 JSON body 或 multipart
 	ct := c.ContentType()
@@ -285,6 +293,9 @@ func (h *Handler) Import(c *gin.Context) {
 			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
 				req.DefaultProxyID = n
 			}
+		}
+		if v := c.PostForm("quarantine"); v != "" {
+			req.Quarantine = v == "true" || v == "1"
 		}
 		// 多文件合并:允许前端一次上传 N 个 json
 		if form, err := c.MultipartForm(); err == nil && form != nil {
@@ -330,16 +341,14 @@ func (h *Handler) Import(c *gin.Context) {
 		UpdateExisting:  upd,
 		DefaultClientID: req.DefaultClientID,
 		DefaultProxyID:  req.DefaultProxyID,
+		Quarantine:      req.Quarantine,
 		BatchSize:       200,
 	}
 	summary := h.svc.ImportBatch(c.Request.Context(), items, opt)
 
-	// 后台踢一次刷新(让新导入的账号尽快探测过期时间 / 额度)
+	// 后台踢一次刷新,让新导入的账号尽快探测过期时间。
 	if h.refresher != nil {
 		h.refresher.Kick()
-	}
-	if h.prober != nil {
-		h.prober.Kick()
 	}
 
 	resp.OK(c, summary)
@@ -422,9 +431,6 @@ func (h *Handler) ImportTokens(c *gin.Context) {
 
 	if h.refresher != nil {
 		h.refresher.Kick()
-	}
-	if h.prober != nil {
-		h.prober.Kick()
 	}
 	resp.OK(c, summary)
 }
@@ -515,62 +521,54 @@ func (h *Handler) RefreshAll(c *gin.Context) {
 
 // POST /api/admin/accounts/:id/probe-quota
 func (h *Handler) ProbeQuota(c *gin.Context) {
-	if h.prober == nil {
+	if h.quotaProber == nil {
 		resp.Internal(c, "额度探测器未初始化")
 		return
 	}
-	id, _ := strconv.ParseUint(c.Param("id"), 10, 64)
-	res, err := h.prober.ProbeByID(c.Request.Context(), id)
-	if err != nil && res == nil {
-		resp.Internal(c, err.Error())
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || id == 0 {
+		resp.BadRequest(c, "账号 id 无效")
 		return
 	}
-	resp.OK(c, res)
-}
-
-// POST /api/admin/accounts/probe-quota-all
-func (h *Handler) ProbeQuotaAll(c *gin.Context) {
-	if h.prober == nil {
-		resp.Internal(c, "额度探测器未初始化")
+	res, err := h.quotaProber.ProbeByID(c.Request.Context(), id)
+	if res != nil {
+		resp.OK(c, res)
 		return
 	}
-	ids, err := h.svc.dao.ListAllActiveIDs(c.Request.Context())
+	if errors.Is(err, ErrNotFound) {
+		resp.NotFound(c, err.Error())
+		return
+	}
 	if err != nil {
 		resp.Internal(c, err.Error())
 		return
 	}
+	resp.Internal(c, "额度探测没有返回结果")
+}
 
-	ctx := c.Request.Context()
-	conc := 8
-	sem := make(chan struct{}, conc)
-	var wg sync.WaitGroup
-	results := make([]*QuotaResult, 0, len(ids))
-	var mu sync.Mutex
-
-	for _, id := range ids {
-		id := id
-		wg.Add(1)
-		sem <- struct{}{}
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			r, err := h.prober.ProbeByID(ctx, id)
-			if r == nil {
-				r = &QuotaResult{AccountID: id}
-				if err != nil {
-					r.Error = err.Error()
-				}
-			}
-			mu.Lock()
-			results = append(results, r)
-			mu.Unlock()
-		}()
+// POST /api/admin/accounts/probe-quota-all
+func (h *Handler) ProbeQuotaAll(c *gin.Context) {
+	if h.quotaProber == nil {
+		resp.Internal(c, "额度探测器未初始化")
+		return
 	}
-	wg.Wait()
-
+	limit := 0
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			resp.BadRequest(c, "limit 必须是非负整数")
+			return
+		}
+		limit = n
+	}
+	results, err := h.quotaProber.ProbeAllActive(c.Request.Context(), limit)
+	if err != nil {
+		resp.Internal(c, err.Error())
+		return
+	}
 	ok, failed := 0, 0
 	for _, r := range results {
-		if r.OK {
+		if r != nil && r.OK {
 			ok++
 		} else {
 			failed++

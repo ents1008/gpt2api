@@ -93,7 +93,7 @@ async function forcePaid(o: rechargeApi.Order) {
     return
   }
   const { value: pwd } = await ElMessageBox.prompt(
-    `请输入管理员密码以确认为订单 ${o.out_trade_no} 强制入账(不会调用上游收银台)。`,
+    `请输入管理员密码以确认为订单 ${o.out_trade_no} 强制入账(不会调用支付收银台)。`,
     '手工入账',
     { type: 'warning', inputType: 'password', confirmButtonText: '确认入账', cancelButtonText: '取消' },
   )
@@ -204,7 +204,7 @@ onMounted(() => {
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="上游单号" min-width="160">
+            <el-table-column label="支付平台单号" min-width="160">
               <template #default="{ row }">
                 <span style="font-size:12px">{{ row.trade_no || '—' }}</span>
               </template>

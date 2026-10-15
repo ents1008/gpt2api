@@ -31,6 +31,14 @@ const maxReferenceImageBytes = 20 * 1024 * 1024
 // 同一次请求最多携带的参考图数量。
 const maxReferenceImages = 4
 
+const (
+	// 文生图的 auth_required / prepare 403 通常在 chat-requirements 阶段快速失败。
+	// 给 fast-fail 账号留出足够窗口;慢 upload / poll 仍由 imageRunTimeout 总预算约束。
+	textImageMaxAttempts = 8
+	// 图生图/编辑沿用同一窗口;是否真的换账号由 Runner 的错误分类门禁控制。
+	referenceImageMaxAttempts = textImageMaxAttempts
+)
+
 // chatMsg 是 OpenAI chat message 的本地别名,便于 handleChatAsImage 内部表达。
 type chatMsg = chatgpt.ChatMessage
 
@@ -90,8 +98,19 @@ type ImageGenResponse struct {
 	TaskID  string         `json:"task_id,omitempty"`
 }
 
-func detachedImageRunContext(timeout time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), timeout)
+func imageRunContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func imageRunTimeout() time.Duration {
+	// AstrBot HTTP read timeout is 300s; return a structured JSON error before
+	// the client converts the backend work into a read-timeout failure. Keep this
+	// close to three account attempts so a degraded pool cannot hold the bot for
+	// four and a half minutes.
+	return 210 * time.Second
 }
 
 func updateImageTaskCost(dao *image.DAO, taskID string, cost int64) {
@@ -121,22 +140,29 @@ func normalizeImageCount(n int) (int, error) {
 	}
 }
 
+func imageGenerationMaxAttempts(referenceCount int) int {
+	if referenceCount > 0 {
+		return referenceImageMaxAttempts
+	}
+	return textImageMaxAttempts
+}
+
 // ImageGenerations POST /v1/images/generations。
 func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 	startAt := time.Now()
 	ak, ok := apikey.FromCtx(c)
 	if !ok {
-		openAIError(c, http.StatusUnauthorized, "missing_api_key", "缺少 API Key")
+		imageOpenAIError(c, http.StatusUnauthorized, "missing_api_key", "缺少 API Key")
 		return
 	}
 
 	var req ImageGenRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		openAIError(c, http.StatusBadRequest, "invalid_request_error", "请求参数错误:"+err.Error())
+		imageOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "请求参数错误:"+err.Error())
 		return
 	}
 	if strings.TrimSpace(req.Prompt) == "" {
-		openAIError(c, http.StatusBadRequest, "invalid_request_error", "prompt 不能为空")
+		imageOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "prompt 不能为空")
 		return
 	}
 	if req.Model == "" {
@@ -144,7 +170,7 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 	}
 	n, err := normalizeImageCount(req.N)
 	if err != nil {
-		openAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+		imageOpenAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 	req.N = n
@@ -176,20 +202,20 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 	// 1) 模型白名单
 	if !ak.ModelAllowed(req.Model) {
 		fail("model_not_allowed")
-		openAIError(c, http.StatusForbidden, "model_not_allowed",
+		imageOpenAIError(c, http.StatusForbidden, "model_not_allowed",
 			fmt.Sprintf("当前 API Key 无权调用模型 %q", req.Model))
 		return
 	}
 	m, err := h.Models.BySlug(c.Request.Context(), req.Model)
 	if err != nil || m == nil || !m.Enabled {
 		fail("model_not_found")
-		openAIError(c, http.StatusBadRequest, "model_not_found",
+		imageOpenAIError(c, http.StatusBadRequest, "model_not_found",
 			fmt.Sprintf("模型 %q 不存在或已下架", req.Model))
 		return
 	}
 	if m.Type != modelpkg.TypeImage {
 		fail("model_type_mismatch")
-		openAIError(c, http.StatusBadRequest, "model_type_mismatch",
+		imageOpenAIError(c, http.StatusBadRequest, "model_type_mismatch",
 			fmt.Sprintf("模型 %q 不是图像模型,不能用于 /v1/images/generations", req.Model))
 		return
 	}
@@ -209,7 +235,7 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 	if h.Limiter != nil {
 		if ok, _, err := h.Limiter.AllowRPM(c.Request.Context(), ak.ID, rpmCap); err == nil && !ok {
 			fail("rate_limit_rpm")
-			openAIError(c, http.StatusTooManyRequests, "rate_limit_rpm",
+			imageOpenAIError(c, http.StatusTooManyRequests, "rate_limit_rpm",
 				"触发每分钟请求数限制 (RPM),请稍后再试")
 			return
 		}
@@ -229,12 +255,12 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 		if err := h.Billing.PreDeduct(c.Request.Context(), ak.UserID, ak.ID, cost, refID, "image prepay"); err != nil {
 			if errors.Is(err, billing.ErrInsufficient) {
 				fail("insufficient_balance")
-				openAIError(c, http.StatusPaymentRequired, "insufficient_balance",
+				imageOpenAIError(c, http.StatusPaymentRequired, "insufficient_balance",
 					"积分不足,请前往「账单与充值」充值后再试")
 				return
 			}
 			fail("billing_error")
-			openAIError(c, http.StatusInternalServerError, "billing_error", "计费异常:"+err.Error())
+			imageOpenAIError(c, http.StatusInternalServerError, "billing_error", "计费异常:"+err.Error())
 			return
 		}
 	}
@@ -265,7 +291,7 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 	if h.DAO != nil {
 		if err := h.DAO.Create(c.Request.Context(), task); err != nil {
 			refund("billing_error")
-			openAIError(c, http.StatusInternalServerError, "internal_error", "创建任务失败:"+err.Error())
+			imageOpenAIError(c, http.StatusInternalServerError, "internal_error", "创建任务失败:"+err.Error())
 			return
 		}
 	}
@@ -274,22 +300,13 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 	refs, err := decodeReferenceInputs(c.Request.Context(), req.ReferenceImages)
 	if err != nil {
 		refund("invalid_request_error")
-		openAIError(c, http.StatusBadRequest, "invalid_reference_image", "参考图解析失败:"+err.Error())
+		imageOpenAIError(c, http.StatusBadRequest, "invalid_reference_image", "参考图解析失败:"+err.Error())
 		return
 	}
 
 	// 5) 执行(同步阻塞)
-	//
-	// 单请求硬上限 8 分钟:给 5 分钟轮询和前置 prepare/SSE 留足缓冲。
-	runCtx, cancel := detachedImageRunContext(8 * time.Minute)
+	runCtx, cancel := imageRunContext(c.Request.Context(), imageRunTimeout())
 	defer cancel()
-
-	// 带参考图时,多轮重试没什么意义(反而会重复上传参考图),只留 1 次尝试。
-	// 纯文生图则放宽到 4 次,避免连续命中两个失效号就直接 502。
-	maxAttempts := 4
-	if len(refs) > 0 {
-		maxAttempts = 1
-	}
 
 	res := h.Runner.Run(runCtx, image.RunOptions{
 		TaskID:        taskID,
@@ -299,7 +316,7 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 		UpstreamModel: m.UpstreamModelSlug,
 		Prompt:        maybeAppendClaritySuffix(req.Prompt),
 		N:             req.N,
-		MaxAttempts:   maxAttempts,
+		MaxAttempts:   imageGenerationMaxAttempts(len(refs)),
 		References:    refs,
 	})
 	rec.AccountID = res.AccountID
@@ -307,7 +324,7 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 	if res.Status != image.StatusSuccess {
 		refund(ifEmpty(res.ErrorCode, "upstream_error"))
 		httpStatus := imageErrorHTTPStatus(res.ErrorCode)
-		openAIError(c, httpStatus, ifEmpty(res.ErrorCode, "upstream_error"),
+		imageOpenAIError(c, httpStatus, ifEmpty(res.ErrorCode, "upstream_error"),
 			localizeImageErr(res.ErrorCode, res.ErrorMessage))
 		return
 	}
@@ -347,29 +364,29 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 func (h *ImagesHandler) ImageTask(c *gin.Context) {
 	ak, ok := apikey.FromCtx(c)
 	if !ok {
-		openAIError(c, http.StatusUnauthorized, "missing_api_key", "缺少 API Key")
+		imageOpenAIError(c, http.StatusUnauthorized, "missing_api_key", "缺少 API Key")
 		return
 	}
 	id := c.Param("id")
 	if id == "" {
-		openAIError(c, http.StatusBadRequest, "invalid_request_error", "task id 不能为空")
+		imageOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "task id 不能为空")
 		return
 	}
 	if h.DAO == nil {
-		openAIError(c, http.StatusInternalServerError, "not_configured", "图片任务存储未初始化,请联系管理员")
+		imageOpenAIError(c, http.StatusInternalServerError, "not_configured", "图片任务存储未初始化,请联系管理员")
 		return
 	}
 	t, err := h.DAO.Get(c.Request.Context(), id)
 	if err != nil {
 		if errors.Is(err, image.ErrNotFound) {
-			openAIError(c, http.StatusNotFound, "not_found", "任务不存在")
+			imageOpenAIError(c, http.StatusNotFound, "not_found", "任务不存在")
 			return
 		}
-		openAIError(c, http.StatusInternalServerError, "internal_error", "查询任务失败:"+err.Error())
+		imageOpenAIError(c, http.StatusInternalServerError, "internal_error", "查询任务失败:"+err.Error())
 		return
 	}
 	if t.UserID != ak.UserID {
-		openAIError(c, http.StatusNotFound, "not_found", "任务不存在")
+		imageOpenAIError(c, http.StatusNotFound, "not_found", "任务不存在")
 		return
 	}
 
@@ -412,7 +429,7 @@ func (h *ImagesHandler) handleChatAsImage(c *gin.Context, rec *usage.Log, ak *ap
 	if strings.TrimSpace(prompt) == "" {
 		rec.Status = usage.StatusFailed
 		rec.ErrorCode = "invalid_request_error"
-		openAIError(c, http.StatusBadRequest, "invalid_request_error",
+		imageOpenAIError(c, http.StatusBadRequest, "invalid_request_error",
 			"图像模型需要用户消息作为 prompt,请检查 messages 内容")
 		return
 	}
@@ -434,7 +451,7 @@ func (h *ImagesHandler) handleChatAsImage(c *gin.Context, rec *usage.Log, ak *ap
 		if ok, _, err := h.Limiter.AllowRPM(c.Request.Context(), ak.ID, rpmCap); err == nil && !ok {
 			rec.Status = usage.StatusFailed
 			rec.ErrorCode = "rate_limit_rpm"
-			openAIError(c, http.StatusTooManyRequests, "rate_limit_rpm",
+			imageOpenAIError(c, http.StatusTooManyRequests, "rate_limit_rpm",
 				"触发每分钟请求数限制 (RPM),请稍后再试")
 			return
 		}
@@ -447,12 +464,12 @@ func (h *ImagesHandler) handleChatAsImage(c *gin.Context, rec *usage.Log, ak *ap
 			rec.Status = usage.StatusFailed
 			if errors.Is(err, billing.ErrInsufficient) {
 				rec.ErrorCode = "insufficient_balance"
-				openAIError(c, http.StatusPaymentRequired, "insufficient_balance",
+				imageOpenAIError(c, http.StatusPaymentRequired, "insufficient_balance",
 					"积分不足,请前往「账单与充值」充值后再试")
 				return
 			}
 			rec.ErrorCode = "billing_error"
-			openAIError(c, http.StatusInternalServerError, "billing_error", "计费异常:"+err.Error())
+			imageOpenAIError(c, http.StatusInternalServerError, "billing_error", "计费异常:"+err.Error())
 			return
 		}
 	}
@@ -482,7 +499,7 @@ func (h *ImagesHandler) handleChatAsImage(c *gin.Context, rec *usage.Log, ak *ap
 		})
 	}
 
-	runCtx, cancel := detachedImageRunContext(8 * time.Minute)
+	runCtx, cancel := imageRunContext(c.Request.Context(), imageRunTimeout())
 	defer cancel()
 
 	res := h.Runner.Run(runCtx, image.RunOptions{
@@ -493,14 +510,14 @@ func (h *ImagesHandler) handleChatAsImage(c *gin.Context, rec *usage.Log, ak *ap
 		UpstreamModel: m.UpstreamModelSlug,
 		Prompt:        maybeAppendClaritySuffix(prompt),
 		N:             1,
-		MaxAttempts:   4,
+		MaxAttempts:   imageGenerationMaxAttempts(0),
 	})
 	rec.AccountID = res.AccountID
 
 	if res.Status != image.StatusSuccess {
 		refund(ifEmpty(res.ErrorCode, "upstream_error"))
 		httpStatus := imageErrorHTTPStatus(res.ErrorCode)
-		openAIError(c, httpStatus, ifEmpty(res.ErrorCode, "upstream_error"),
+		imageOpenAIError(c, httpStatus, ifEmpty(res.ErrorCode, "upstream_error"),
 			localizeImageErr(res.ErrorCode, res.ErrorMessage))
 		return
 	}
@@ -564,52 +581,334 @@ func ifEmpty(s, fallback string) string {
 	return s
 }
 
-// localizeImageErr 把 runner 返回的英文错误码 + 原始 err.Error() 压成一段中文提示,
-// 方便前端 / SDK 用户直接看懂。原始英文 message 作为后缀保留以便排障。
+// localizeImageErr 把 runner 返回的错误码 + 可公开的错误详情压成一段中文提示,
+// 方便前端 / SDK 用户直接看懂。内部供应商/账号诊断信息只留在日志/DB,不进入公开响应。
 func localizeImageErr(code, raw string) string {
 	var zh string
 	switch code {
 	case image.ErrNoAccount:
-		zh = "账号池暂无可用账号,请稍后重试"
+		zh = "图片服务繁忙,请稍后重试"
+	case image.ErrQuotaDepleted:
+		zh = "图片服务繁忙,请稍后重试"
+	case image.ErrAuthRequired:
+		zh = "图片服务授权状态异常,请稍后重试"
+	case image.ErrUpstreamForbidden:
+		zh = "图片服务状态异常,请稍后重试"
 	case image.ErrRateLimited:
-		zh = "上游风控,请稍后再试"
+		zh = "图片服务请求过于频繁,请稍后再试"
+	case image.ErrNetworkTransient:
+		zh = "图片服务网络波动,请重试"
+	case image.ErrPOWTimeout, image.ErrPOWFailed, image.ErrTurnstile:
+		zh = "图片服务验证未通过,请稍后重试"
 	case image.ErrContentPolicyRejected:
-		zh = "提示词触发上游内容政策拒绝"
+		zh = "提示词可能违反内容安全策略,请修改后重试"
 	case image.ErrImageAsyncError:
-		zh = "上游图片任务返回错误"
+		zh = "图片生成任务返回错误"
 	case image.ErrAssistantReply:
-		zh = "上游没有进入图片生成,返回了文本回复"
+		if detail := publicAssistantReplyDetail(raw); detail != "" {
+			return "图像助手回复:" + detail
+		}
+		zh = "图片生成未启动,返回了文本回复"
 	case image.ErrConversationPoll:
-		zh = "上游会话轮询异常"
+		zh = "图片任务状态查询异常,请重试"
 	case image.ErrImageTaskStalled:
-		zh = "上游已接单,但图片任务未继续产出结果"
+		zh = "图片任务未返回结果,请重试"
 	case image.ErrImageToolNoAsset:
-		zh = "上游返回了工具消息,但没有图片资产"
+		zh = "图片生成未返回可用图片,请重试"
 	case image.ErrTurnstileStalled:
-		zh = "上游要求 Turnstile,图片任务未继续产出结果"
+		zh = "图片服务验证卡住,请稍后重试"
 	case image.ErrFreeAccountStalled:
-		zh = "免费账号链路已接单,但图片任务未继续产出结果"
+		zh = "图片任务未返回结果,请稍后重试"
+	case image.ErrDownload:
+		zh = "图片下载地址生成失败,请重试"
 	case image.ErrUnknown, "":
 		zh = "图片生成失败"
-	case "upstream_error":
-		zh = "上游返回错误"
+	case image.ErrUpstream:
+		if isInternalImageTransportError(raw) {
+			return "图片服务网络波动,请重试"
+		}
+		zh = "图片服务返回错误"
 	default:
 		zh = "图片生成失败(" + code + ")"
 	}
-	if raw != "" && raw != code {
-		return zh + ":" + raw
+	if code == image.ErrContentPolicyRejected || chatgpt.IsContentPolicyText(raw) {
+		return "提示词可能违反内容安全策略,请修改后重试"
+	}
+	if code == image.ErrAssistantReply {
+		return zh
+	}
+	detail := publicImageErrorDetail(code, raw)
+	if detail != "" && detail != code {
+		return zh + ":" + detail
 	}
 	return zh
 }
 
+func publicAssistantReplyDetail(raw string) string {
+	detail := strings.TrimSpace(raw)
+	if detail == "" || detail == image.ErrAssistantReply {
+		return ""
+	}
+	if strings.HasPrefix(detail, image.ErrAssistantReply+":") {
+		detail = strings.TrimSpace(strings.TrimPrefix(detail, image.ErrAssistantReply+":"))
+	}
+	if detail == "" {
+		return ""
+	}
+	detail = publicImageErrorText(detail)
+	detail = replaceInternalImageProviderWording(detail)
+	detail = strings.Trim(strings.TrimSpace(detail), " ;,，:：")
+	if detail == "" || hasInternalImageProviderWording(detail) || isTechnicalImageErrorPlaceholder(detail) || isJSONLikeImageErrorText(detail) {
+		return ""
+	}
+	return detail
+}
+
+func publicImageErrorDetail(code, raw string) string {
+	detail := strings.TrimSpace(raw)
+	if detail == "" || detail == code {
+		return ""
+	}
+	if shouldHideImageRawDetail(code) {
+		return ""
+	}
+	if strings.HasPrefix(detail, code+":") {
+		detail = strings.TrimSpace(strings.TrimPrefix(detail, code+":"))
+	}
+	if detail == "" || detail == code {
+		return ""
+	}
+
+	detail = publicImageErrorText(detail)
+	detail = replaceInternalImageProviderWording(detail)
+	detail = strings.Trim(strings.TrimSpace(detail), " ;,，:：")
+	if detail == "" || detail == code || hasInternalImageProviderWording(detail) {
+		if generic := genericImageErrorDetail(code); generic != "" {
+			return generic
+		}
+		return ""
+	}
+	if isTechnicalImageErrorPlaceholder(detail) {
+		if generic := genericImageErrorDetail(code); generic != "" {
+			return generic
+		}
+	}
+	return detail
+}
+
+func isInternalImageTransportError(raw string) bool {
+	lower := strings.ToLower(raw)
+	for _, marker := range []string{
+		"upload reference",
+		"upload put",
+		"oaiusercontent.com",
+		"sdmntpr",
+		"sig=",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldHideImageRawDetail(code string) bool {
+	switch code {
+	case image.ErrNoAccount,
+		image.ErrQuotaDepleted,
+		image.ErrAuthRequired,
+		image.ErrUpstreamForbidden,
+		image.ErrRateLimited,
+		image.ErrNetworkTransient,
+		image.ErrPOWTimeout,
+		image.ErrPOWFailed,
+		image.ErrTurnstile,
+		image.ErrConversationPoll,
+		image.ErrImageTaskStalled,
+		image.ErrImageToolNoAsset,
+		image.ErrTurnstileStalled,
+		image.ErrFreeAccountStalled,
+		image.ErrDownload:
+		return true
+	default:
+		return false
+	}
+}
+
+func isJSONLikeImageErrorText(s string) bool {
+	v := strings.TrimSpace(s)
+	if v == "" {
+		return false
+	}
+	return (strings.HasPrefix(v, "{") && strings.HasSuffix(v, "}")) ||
+		(strings.HasPrefix(v, "[") && strings.HasSuffix(v, "]")) ||
+		strings.HasPrefix(strings.TrimSpace(v), `"prompt":`) ||
+		strings.HasPrefix(strings.TrimSpace(v), `{"prompt":`)
+}
+
+func publicImageErrorText(s string) string {
+	detail := stripLeadingImageDiagnostic(strings.TrimSpace(s))
+	detail = keepPublicImageErrorSegments(detail)
+	return strings.TrimSpace(detail)
+}
+
+func stripLeadingImageDiagnostic(s string) string {
+	for _, sep := range []string{":", "：", ",", "，", ";", "；"} {
+		idx := strings.Index(s, sep)
+		if idx <= 0 {
+			continue
+		}
+		prefix := strings.TrimSpace(s[:idx])
+		if hasInternalImageProviderWording(prefix) || isTechnicalImageDiagnosticPrefix(prefix) {
+			return strings.TrimSpace(s[idx+len(sep):])
+		}
+	}
+	return s
+}
+
+func keepPublicImageErrorSegments(s string) string {
+	parts := splitImageErrorSegments(s)
+	if len(parts) == 0 {
+		return s
+	}
+	var kept []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || hasInternalImageProviderWording(part) {
+			continue
+		}
+		kept = append(kept, part)
+	}
+	return strings.Join(kept, "")
+}
+
+func splitImageErrorSegments(s string) []string {
+	var parts []string
+	var b strings.Builder
+	for _, r := range s {
+		b.WriteRune(r)
+		switch r {
+		case '\n', ';', '；', '。':
+			parts = append(parts, b.String())
+			b.Reset()
+		}
+	}
+	if tail := b.String(); strings.TrimSpace(tail) != "" {
+		parts = append(parts, tail)
+	}
+	return parts
+}
+
+func isTechnicalImageDiagnosticPrefix(s string) bool {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	for _, marker := range []string{
+		"content policy",
+		"image task rejected",
+		"图片任务失败",
+		"图片任务返回错误",
+		"拒绝",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isTechnicalImageErrorPlaceholder(s string) bool {
+	lower := strings.ToLower(strings.Trim(strings.TrimSpace(s), " ;,，:：.。"))
+	for _, placeholder := range []string{
+		"content policy",
+		"service content policy",
+		"服务 content policy",
+		"image task rejected",
+		"service image task rejected",
+		"服务 image task rejected",
+	} {
+		if lower == placeholder {
+			return true
+		}
+	}
+	return false
+}
+
+func genericImageErrorDetail(code string) string {
+	switch code {
+	case image.ErrContentPolicyRejected:
+		return "图片内容安全校验未通过"
+	case image.ErrImageAsyncError:
+		return "图片任务执行失败"
+	case image.ErrAssistantReply:
+		return "图片任务被拒绝"
+	default:
+		return ""
+	}
+}
+
+func replaceInternalImageProviderWording(s string) string {
+	replacer := strings.NewReplacer(
+		"chatgpt-freeaccount", "图片服务",
+		"ChatGPT", "图片服务",
+		"CHATGPT", "图片服务",
+		"chatgpt", "图片服务",
+		"UPSTREAM", "服务",
+		"Upstream", "服务",
+		"upstream", "服务",
+		"上游", "服务",
+		"账号池", "服务资源",
+		"当前账号", "当前服务资源",
+		"免费账号", "服务资源",
+		"free_account", "service_resource",
+		"free account", "service resource",
+	)
+	return replacer.Replace(s)
+}
+
+func hasInternalImageProviderWording(s string) bool {
+	lower := strings.ToLower(s)
+	for _, marker := range []string{
+		"上游",
+		"upstream",
+		"chatgpt",
+		"chatgpt-freeaccount",
+		"账号池",
+		"当前账号",
+		"免费账号",
+		"free_account",
+		"free account",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func imageErrorHTTPStatus(code string) int {
 	switch code {
-	case image.ErrNoAccount, image.ErrRateLimited:
+	case image.ErrNoAccount,
+		image.ErrQuotaDepleted,
+		image.ErrAuthRequired,
+		image.ErrUpstreamForbidden,
+		image.ErrRateLimited,
+		image.ErrNetworkTransient,
+		image.ErrPOWTimeout,
+		image.ErrPOWFailed,
+		image.ErrTurnstile,
+		image.ErrConversationPoll,
+		image.ErrImageTaskStalled,
+		image.ErrImageToolNoAsset,
+		image.ErrTurnstileStalled,
+		image.ErrFreeAccountStalled,
+		image.ErrDownload,
+		image.ErrUnknown,
+		image.ErrUpstream,
+		image.ErrInvalidResponse:
 		return http.StatusServiceUnavailable
 	case image.ErrContentPolicyRejected, image.ErrImageAsyncError, image.ErrAssistantReply:
 		return http.StatusBadRequest
 	default:
-		return http.StatusBadGateway
+		return http.StatusServiceUnavailable
 	}
 }
 
@@ -649,19 +948,19 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 	startAt := time.Now()
 	ak, ok := apikey.FromCtx(c)
 	if !ok {
-		openAIError(c, http.StatusUnauthorized, "missing_api_key", "缺少 API Key")
+		imageOpenAIError(c, http.StatusUnauthorized, "missing_api_key", "缺少 API Key")
 		return
 	}
 
 	// multipart 上限:单文件 20MB * 最多 4 张 + 冗余。
 	if err := c.Request.ParseMultipartForm(int64(maxReferenceImageBytes) * int64(maxReferenceImages+1)); err != nil {
-		openAIError(c, http.StatusBadRequest, "invalid_request_error", "解析 multipart 失败:"+err.Error())
+		imageOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "解析 multipart 失败:"+err.Error())
 		return
 	}
 
 	prompt := strings.TrimSpace(c.Request.FormValue("prompt"))
 	if prompt == "" {
-		openAIError(c, http.StatusBadRequest, "invalid_request_error", "prompt 不能为空")
+		imageOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "prompt 不能为空")
 		return
 	}
 	model := c.Request.FormValue("model")
@@ -672,12 +971,12 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 	if s := c.Request.FormValue("n"); s != "" {
 		v, err := parseIntClamp(s, 1, 8)
 		if err != nil {
-			openAIError(c, http.StatusBadRequest, "invalid_request_error", "n 仅支持 1、2、4、8")
+			imageOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "n 仅支持 1、2、4、8")
 			return
 		}
 		n0, err := normalizeImageCount(v)
 		if err != nil {
-			openAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+			imageOpenAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
 		n = n0
@@ -691,15 +990,15 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 	// 主图 + 可能的多张
 	files, err := collectEditFiles(c.Request.MultipartForm)
 	if err != nil {
-		openAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+		imageOpenAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 	if len(files) == 0 {
-		openAIError(c, http.StatusBadRequest, "invalid_request_error", "至少需要上传一张 image 作为参考图")
+		imageOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "至少需要上传一张 image 作为参考图")
 		return
 	}
 	if len(files) > maxReferenceImages {
-		openAIError(c, http.StatusBadRequest, "invalid_request_error",
+		imageOpenAIError(c, http.StatusBadRequest, "invalid_request_error",
 			fmt.Sprintf("最多支持 %d 张参考图", maxReferenceImages))
 		return
 	}
@@ -707,17 +1006,17 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 	for _, fh := range files {
 		data, err := readMultipart(fh)
 		if err != nil {
-			openAIError(c, http.StatusBadRequest, "invalid_reference_image",
+			imageOpenAIError(c, http.StatusBadRequest, "invalid_reference_image",
 				fmt.Sprintf("读取 %q 失败:%s", fh.Filename, err.Error()))
 			return
 		}
 		if len(data) == 0 {
-			openAIError(c, http.StatusBadRequest, "invalid_reference_image",
+			imageOpenAIError(c, http.StatusBadRequest, "invalid_reference_image",
 				fmt.Sprintf("参考图 %q 为空", fh.Filename))
 			return
 		}
 		if len(data) > maxReferenceImageBytes {
-			openAIError(c, http.StatusBadRequest, "invalid_reference_image",
+			imageOpenAIError(c, http.StatusBadRequest, "invalid_reference_image",
 				fmt.Sprintf("参考图 %q 超过 %dMB 上限", fh.Filename, maxReferenceImageBytes/1024/1024))
 			return
 		}
@@ -747,20 +1046,20 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 
 	if !ak.ModelAllowed(model) {
 		fail("model_not_allowed")
-		openAIError(c, http.StatusForbidden, "model_not_allowed",
+		imageOpenAIError(c, http.StatusForbidden, "model_not_allowed",
 			fmt.Sprintf("当前 API Key 无权调用模型 %q", model))
 		return
 	}
 	m, err := h.Models.BySlug(c.Request.Context(), model)
 	if err != nil || m == nil || !m.Enabled {
 		fail("model_not_found")
-		openAIError(c, http.StatusBadRequest, "model_not_found",
+		imageOpenAIError(c, http.StatusBadRequest, "model_not_found",
 			fmt.Sprintf("模型 %q 不存在或已下架", model))
 		return
 	}
 	if m.Type != modelpkg.TypeImage {
 		fail("model_type_mismatch")
-		openAIError(c, http.StatusBadRequest, "model_type_mismatch",
+		imageOpenAIError(c, http.StatusBadRequest, "model_type_mismatch",
 			fmt.Sprintf("模型 %q 不是图像模型,不能用于 /v1/images/edits", model))
 		return
 	}
@@ -779,7 +1078,7 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 	if h.Limiter != nil {
 		if ok, _, err := h.Limiter.AllowRPM(c.Request.Context(), ak.ID, rpmCap); err == nil && !ok {
 			fail("rate_limit_rpm")
-			openAIError(c, http.StatusTooManyRequests, "rate_limit_rpm",
+			imageOpenAIError(c, http.StatusTooManyRequests, "rate_limit_rpm",
 				"触发每分钟请求数限制 (RPM),请稍后再试")
 			return
 		}
@@ -790,12 +1089,12 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 		if err := h.Billing.PreDeduct(c.Request.Context(), ak.UserID, ak.ID, cost, refID, "image-edit prepay"); err != nil {
 			if errors.Is(err, billing.ErrInsufficient) {
 				fail("insufficient_balance")
-				openAIError(c, http.StatusPaymentRequired, "insufficient_balance",
+				imageOpenAIError(c, http.StatusPaymentRequired, "insufficient_balance",
 					"积分不足,请前往「账单与充值」充值后再试")
 				return
 			}
 			fail("billing_error")
-			openAIError(c, http.StatusInternalServerError, "billing_error", "计费异常:"+err.Error())
+			imageOpenAIError(c, http.StatusInternalServerError, "billing_error", "计费异常:"+err.Error())
 			return
 		}
 	}
@@ -825,7 +1124,7 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 		})
 	}
 
-	runCtx, cancel := detachedImageRunContext(8 * time.Minute)
+	runCtx, cancel := imageRunContext(c.Request.Context(), imageRunTimeout())
 	defer cancel()
 
 	res := h.Runner.Run(runCtx, image.RunOptions{
@@ -836,7 +1135,7 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 		UpstreamModel: m.UpstreamModelSlug,
 		Prompt:        maybeAppendClaritySuffix(prompt),
 		N:             n,
-		MaxAttempts:   1, // 带参考图时只跑一次,避免重复上传
+		MaxAttempts:   imageGenerationMaxAttempts(len(refs)),
 		References:    refs,
 	})
 	rec.AccountID = res.AccountID
@@ -844,7 +1143,7 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 	if res.Status != image.StatusSuccess {
 		refund(ifEmpty(res.ErrorCode, "upstream_error"))
 		httpStatus := imageErrorHTTPStatus(res.ErrorCode)
-		openAIError(c, httpStatus, ifEmpty(res.ErrorCode, "upstream_error"),
+		imageOpenAIError(c, httpStatus, ifEmpty(res.ErrorCode, "upstream_error"),
 			localizeImageErr(res.ErrorCode, res.ErrorMessage))
 		return
 	}

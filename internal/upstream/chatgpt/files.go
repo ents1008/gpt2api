@@ -20,7 +20,7 @@
 //   - metadata.attachments 加一项 {id, mimeType, name, size, height?, width?}
 //
 // 注意:upload_url 指向 Azure,不要走同一个 chatgpt.com 代理/utls transport,
-// 这里用单独的一个 http.Client(沿用 Client 内部的 Transport 走代理,但不带 Auth/Oai-* 头)。
+// 这里用无代理的 asset client,也不带 Auth/Oai-* 头。
 
 package chatgpt
 
@@ -47,17 +47,17 @@ type UploadedFile struct {
 	FileName    string `json:"file_name"`
 	FileSize    int    `json:"file_size"`
 	MimeType    string `json:"mime_type"`
-	UseCase     string `json:"use_case"`          // 图片: multimodal, 文件: my_files
-	Width       int    `json:"width,omitempty"`   // 仅图片
-	Height      int    `json:"height,omitempty"`  // 仅图片
-	DownloadURL string `json:"download_url"`      // POST /uploaded 返回,通常不直接用
+	UseCase     string `json:"use_case"`         // 图片: multimodal, 文件: my_files
+	Width       int    `json:"width,omitempty"`  // 仅图片
+	Height      int    `json:"height,omitempty"` // 仅图片
+	DownloadURL string `json:"download_url"`     // POST /uploaded 返回,通常不直接用
 }
 
 // UploadFile 执行完整三步上传。调用方传入原始字节 + 建议的文件名即可。
 // 识别到 image/* 时会尝试 Decode 拿到宽高(Decode 失败不致命,按 0 处理)。
 //
-// 实践经验:步骤 1、3 走 chatgpt.com(uTLS / 代理 / auth 头),步骤 2 走 Azure,
-// 用同一条 http.Client 但是请求头手动裁剪;Azure 的 SAS URL 本身带鉴权。
+// 实践经验:步骤 1、3 走 chatgpt.com(uTLS / 账号控制代理 / auth 头),步骤 2
+// 走无代理 asset client;Azure 的 SAS URL 本身带鉴权,原始文件字节不得消耗代理流量。
 func (c *Client) UploadFile(ctx context.Context, data []byte, fileName string) (*UploadedFile, error) {
 	if len(data) == 0 {
 		return nil, errors.New("empty file data")
@@ -143,15 +143,18 @@ func (c *Client) UploadFile(ctx context.Context, data []byte, fileName string) (
 	req2.Header.Set("x-ms-blob-type", "BlockBlob")
 	req2.Header.Set("x-ms-version", "2020-04-08")
 	req2.Header.Set("Origin", c.opts.BaseURL)
-	req2.Header.Set("User-Agent", c.opts.UserAgent)
+	req2.Header.Set("User-Agent", c.profile.UserAgent())
 	req2.Header.Set("Accept", "application/json, text/plain, */*")
-	req2.Header.Set("Accept-Language", "en-US,en;q=0.8")
+	req2.Header.Set("Accept-Language", c.profile.Headers["Accept-Language"])
 	req2.Header.Set("Referer", c.opts.BaseURL+"/")
-	res2, err := c.hc.Do(req2)
+	res2, err := c.assetHC.Do(req2)
 	if err != nil {
 		return nil, fmt.Errorf("upload PUT: %w", err)
 	}
 	defer res2.Body.Close()
+	if c.opts.TrafficMeter != nil {
+		c.opts.TrafficMeter.directAssetWrittenBytes.Add(int64(len(data)))
+	}
 	if res2.StatusCode >= 400 {
 		buf2, _ := io.ReadAll(res2.Body)
 		return nil, &UpstreamError{Status: res2.StatusCode, Message: "upload PUT failed", Body: string(buf2)}

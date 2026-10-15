@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"strings"
 	"sync"
 	"time"
@@ -55,10 +56,8 @@ func NewQuotaProber(svc *Service, settings QuotaSettings, logger *zap.Logger) *Q
 		settings: settings,
 		log:      logger,
 		// client 仅作为"没代理也没 uTLS transport 构造失败"的退路,一般不会走到
-		client: &http.Client{
-			Timeout: 20 * time.Second,
-		},
-		kick: make(chan struct{}, 1),
+		client: newQuotaHTTPClient(nil, 20*time.Second),
+		kick:   make(chan struct{}, 1),
 	}
 }
 
@@ -66,24 +65,43 @@ func NewQuotaProber(svc *Service, settings QuotaSettings, logger *zap.Logger) *Q
 func (q *QuotaProber) SetProxyResolver(pr AccountProxyResolver) { q.proxyResolver = pr }
 
 // clientFor 返回一个带 uTLS(伪 Chrome ClientHello)的 http.Client。
+// 代理配置错误直接返回，不把账号静默切到直连出口。
 //
 // 历史背景:探测额度的落点是 POST /backend-api/conversation/init,这条路径和
 // 生图走的 f/conversation 同一道 Cloudflare 指纹校验。用 Go 默认 net/http 的
 // 标准 TLS 指纹发请求,JA3/JA4 立刻对不上 Chrome,被 403 挡住;而生图之所以
 // 没事是因为它走的是 chatgpt.NewUTLSTransport(内部 parrot 成 Chrome)。
 // 这里统一复用同一套 uTLS transport,保持整个"后台对 chatgpt.com 的触碰"指纹一致。
-func (q *QuotaProber) clientFor(ctx context.Context, accountID uint64) *http.Client {
+func (q *QuotaProber) clientFor(ctx context.Context, a *Account) (*http.Client, error) {
+	accountID := uint64(0)
+	if a != nil {
+		accountID = a.ID
+	}
 	proxyURL := ""
 	if q.proxyResolver != nil {
 		proxyURL = q.proxyResolver.ProxyURLForAccount(ctx, accountID)
 	}
 	tr, err := chatgpt.NewUTLSTransport(proxyURL, 30*time.Second)
 	if err != nil {
-		q.log.Warn("build utls transport for quota probe failed, fallback std http",
-			zap.Uint64("account_id", accountID), zap.Error(err))
-		return q.client
+		return nil, fmt.Errorf("build utls transport for quota probe account=%d: %w", accountID, err)
 	}
-	return &http.Client{Transport: tr, Timeout: q.client.Timeout}
+	client := newQuotaHTTPClient(tr, q.client.Timeout)
+	if q.svc != nil && a != nil {
+		if cookies, err := q.svc.DecryptCookies(ctx, a.ID); err == nil && cookies != "" {
+			if err := chatgpt.LoadCookies(client.Jar, chatgpt.BaseURL, cookies); err != nil {
+				if q.log != nil {
+					q.log.Warn("load account cookies for quota probe failed",
+						zap.Uint64("account_id", a.ID), zap.Error(err))
+				}
+			}
+		}
+	}
+	return client, nil
+}
+
+func newQuotaHTTPClient(tr http.RoundTripper, timeout time.Duration) *http.Client {
+	jar, _ := cookiejar.New(nil)
+	return &http.Client{Transport: tr, Timeout: timeout, Jar: jar}
 }
 
 func (q *QuotaProber) Kick() {
@@ -126,31 +144,9 @@ func (q *QuotaProber) Run(ctx context.Context) {
 }
 
 func (q *QuotaProber) scanOnce(ctx context.Context) {
-	minInterval := q.settings.AccountQuotaProbeIntervalSec()
-	conc := q.settings.AccountRefreshConcurrency()
-
-	rows, err := q.svc.dao.ListNeedProbeQuota(ctx, minInterval, 256)
-	if err != nil {
-		q.log.Warn("list quota probe candidates failed", zap.Error(err))
-		return
+	if _, err := q.ProbeDue(ctx, 256); err != nil {
+		q.log.Warn("quota probe scan failed", zap.Error(err))
 	}
-	if len(rows) == 0 {
-		return
-	}
-
-	sem := make(chan struct{}, conc)
-	var wg sync.WaitGroup
-	for _, a := range rows {
-		a := a
-		wg.Add(1)
-		sem <- struct{}{}
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			_, _ = q.ProbeOne(ctx, a)
-		}()
-	}
-	wg.Wait()
 }
 
 // ProbeByID 指定账号探测。
@@ -160,6 +156,85 @@ func (q *QuotaProber) ProbeByID(ctx context.Context, id uint64) (*QuotaResult, e
 		return nil, err
 	}
 	return q.ProbeOne(ctx, a)
+}
+
+// ProbeDue 探测按配置到期的健康候选账号。后台循环只调用这一条路径。
+func (q *QuotaProber) ProbeDue(ctx context.Context, limit int) ([]*QuotaResult, error) {
+	if limit <= 0 {
+		limit = 256
+	}
+	rows, err := q.svc.dao.ListNeedProbeQuota(ctx, q.quotaProbeIntervalSec(), limit)
+	if err != nil {
+		return nil, err
+	}
+	return q.probeAccounts(ctx, rows), nil
+}
+
+// ProbeAllActive 手动探测所有未软删账号。limit=0 表示不限制数量。
+func (q *QuotaProber) ProbeAllActive(ctx context.Context, limit int) ([]*QuotaResult, error) {
+	rows, err := q.svc.dao.ListAllActive(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	return q.probeAccounts(ctx, rows), nil
+}
+
+func (q *QuotaProber) probeAccounts(ctx context.Context, rows []*Account) []*QuotaResult {
+	results := make([]*QuotaResult, len(rows))
+	if len(rows) == 0 {
+		return results
+	}
+
+	conc := q.quotaProbeConcurrency()
+	if conc > len(rows) {
+		conc = len(rows)
+	}
+	sem := make(chan struct{}, conc)
+	var wg sync.WaitGroup
+	for i, a := range rows {
+		i, a := i, a
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			res, err := q.ProbeOne(ctx, a)
+			if res == nil {
+				res = &QuotaResult{AccountID: a.ID, Email: a.Email}
+			}
+			if err != nil && res.Error == "" {
+				res.Error = friendlyProbeErr(err)
+			}
+			results[i] = res
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
+func (q *QuotaProber) quotaProbeIntervalSec() int {
+	if q.settings == nil {
+		return 18000
+	}
+	n := q.settings.AccountQuotaProbeIntervalSec()
+	if n <= 0 {
+		return 18000
+	}
+	return n
+}
+
+func (q *QuotaProber) quotaProbeConcurrency() int {
+	if q.settings == nil {
+		return 4
+	}
+	n := q.settings.AccountRefreshConcurrency()
+	if n <= 0 {
+		return 4
+	}
+	if n > 32 {
+		return 32
+	}
+	return n
 }
 
 // ProbeOne 执行一次探测。
@@ -222,15 +297,48 @@ type probeOutcome struct {
 //     当成脚本直接 403;
 //   - User-Agent / sec-ch-ua 两者的版本号必须一致(都是 Edge 143),否则"指纹冲突"。
 func (q *QuotaProber) doProbe(ctx context.Context, a *Account, accessToken string) (out probeOutcome, err error) {
+	client, clientErr := q.clientFor(ctx, a)
+	if clientErr != nil {
+		return out, clientErr
+	}
+	return q.doProbeWithClient(ctx, a, accessToken, client)
+}
+
+func (q *QuotaProber) doProbeWithClient(ctx context.Context, a *Account, accessToken string, client *http.Client) (out probeOutcome, err error) {
 	out.remaining = -1
 	out.total = -1
+	if client == nil {
+		client = q.client
+	}
+	if client == nil {
+		client = newQuotaHTTPClient(nil, 20*time.Second)
+	}
 
-	// timezone_offset_min: 跟 UI 一致发 -480(北京时间),非关键
-	reqBody := []byte(`{"gizmo_id":null,"requested_default_model":null,"conversation_id":null,"timezone_offset_min":-480,"system_hints":["picture_v2"]}`)
+	profile, _, profileErr := chatgpt.ParseBrowserProfileJSON(a.BrowserProfile)
+	if profileErr != nil {
+		err = profileErr
+		return
+	}
+	reqBody, marshalErr := json.Marshal(map[string]interface{}{
+		"gizmo_id":                nil,
+		"requested_default_model": nil,
+		"conversation_id":         nil,
+		"timezone_offset_min":     profile.TimezoneOffsetMinutes(time.Now()),
+		"system_hints":            []string{"picture_v2"},
+	})
+	if marshalErr != nil {
+		err = marshalErr
+		return
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST",
 		"https://chatgpt.com/backend-api/conversation/init", bytes.NewReader(reqBody))
 	if err != nil {
+		return
+	}
+	deviceID := quotaDeviceID(a)
+	if e := bootstrapQuotaSession(ctx, client, deviceID, profile); e != nil {
+		err = e
 		return
 	}
 
@@ -240,20 +348,9 @@ func (q *QuotaProber) doProbe(ctx context.Context, a *Account, accessToken strin
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Origin", chatgpt.BaseURL)
 	req.Header.Set("Referer", chatgpt.BaseURL+"/")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6")
-	req.Header.Set("User-Agent", chatgpt.DefaultUserAgent)
+	chatgpt.ApplyBrowserFingerprintHeaders(req.Header, profile)
 
 	// ── Client-Hints(Edge 143 @ Windows 11,必须跟 UA 版本一致)──
-	req.Header.Set("Sec-Ch-Ua", `"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"`)
-	req.Header.Set("Sec-Ch-Ua-Arch", `"x86"`)
-	req.Header.Set("Sec-Ch-Ua-Bitness", `"64"`)
-	req.Header.Set("Sec-Ch-Ua-Full-Version", `"143.0.3650.96"`)
-	req.Header.Set("Sec-Ch-Ua-Full-Version-List",
-		`"Microsoft Edge";v="143.0.3650.96", "Chromium";v="143.0.7499.147", "Not A(Brand";v="24.0.0.0"`)
-	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
-	req.Header.Set("Sec-Ch-Ua-Model", `""`)
-	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
-	req.Header.Set("Sec-Ch-Ua-Platform-Version", `"19.0.0"`)
 
 	// ── Fetch 元数据(同源 XHR)──
 	req.Header.Set("Sec-Fetch-Dest", "empty")
@@ -267,15 +364,11 @@ func (q *QuotaProber) doProbe(ctx context.Context, a *Account, accessToken strin
 	// ── Oai-* 业务指纹(chatgpt.com 自己埋的)──
 	// DeviceID 缺失会触发降权/频繁 403,这里用账号绑定的;实在没存就退回随机填充,
 	// 起码让请求长得像浏览器。
-	deviceID := strings.TrimSpace(a.OAIDeviceID)
-	if deviceID == "" {
-		deviceID = fallbackDeviceID(a.ID)
-	}
 	req.Header.Set("Oai-Device-Id", deviceID)
 	if sid := strings.TrimSpace(a.OAISessionID); sid != "" {
 		req.Header.Set("Oai-Session-Id", sid)
 	}
-	req.Header.Set("Oai-Language", chatgpt.DefaultLanguage)
+	req.Header.Set("Oai-Language", profile.Language)
 	req.Header.Set("Oai-Client-Version", chatgpt.DefaultClientVersion)
 	req.Header.Set("Oai-Client-Build-Number", chatgpt.DefaultClientBuildNum)
 
@@ -283,7 +376,7 @@ func (q *QuotaProber) doProbe(ctx context.Context, a *Account, accessToken strin
 	req.Header.Set("X-Openai-Target-Path", req.URL.Path)
 	req.Header.Set("X-Openai-Target-Route", req.URL.Path)
 
-	resp, e := q.clientFor(ctx, a.ID).Do(req)
+	resp, e := client.Do(req)
 	if e != nil {
 		err = e
 		return
@@ -296,9 +389,9 @@ func (q *QuotaProber) doProbe(ctx context.Context, a *Account, accessToken strin
 	}
 
 	var payload struct {
-		Type             string   `json:"type"`
-		BlockedFeatures  []string `json:"blocked_features"`
-		DefaultModelSlug string   `json:"default_model_slug"`
+		Type             string             `json:"type"`
+		BlockedFeatures  flexibleStringList `json:"blocked_features"`
+		DefaultModelSlug string             `json:"default_model_slug"`
 		LimitsProgress   []struct {
 			FeatureName string `json:"feature_name"`
 			Remaining   *int   `json:"remaining"`
@@ -329,6 +422,87 @@ func (q *QuotaProber) doProbe(ctx context.Context, a *Account, accessToken strin
 		}
 	}
 	return
+}
+
+type flexibleStringList []string
+
+func (l *flexibleStringList) UnmarshalJSON(data []byte) error {
+	var raw []interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		switch v := item.(type) {
+		case string:
+			if s := strings.TrimSpace(v); s != "" {
+				out = append(out, s)
+			}
+		case map[string]interface{}:
+			if s := blockedFeatureObjectName(v); s != "" {
+				out = append(out, s)
+				continue
+			}
+			if b, err := json.Marshal(v); err == nil {
+				out = append(out, truncate(string(b), 120))
+			}
+		}
+	}
+	*l = out
+	return nil
+}
+
+func blockedFeatureObjectName(v map[string]interface{}) string {
+	for _, key := range []string{"feature_name", "name", "id", "key", "type"} {
+		if raw, ok := v[key]; ok {
+			if s, ok := raw.(string); ok {
+				if s = strings.TrimSpace(s); s != "" {
+					return s
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func quotaDeviceID(a *Account) string {
+	if a == nil {
+		return fallbackDeviceID(0)
+	}
+	deviceID := strings.TrimSpace(a.OAIDeviceID)
+	if deviceID == "" {
+		deviceID = fallbackDeviceID(a.ID)
+	}
+	return deviceID
+}
+
+func bootstrapQuotaSession(ctx context.Context, client *http.Client, deviceID string, profile chatgpt.BrowserProfile) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, chatgpt.BaseURL+"/", nil)
+	if err != nil {
+		return err
+	}
+	chatgpt.ApplyBrowserFingerprintHeaders(req.Header, profile)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("Oai-Device-Id", deviceID)
+	req.Header.Set("Oai-Language", profile.Language)
+	req.Header.Set("Oai-Client-Version", chatgpt.DefaultClientVersion)
+	req.Header.Set("Oai-Client-Build-Number", chatgpt.DefaultClientBuildNum)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("bootstrap http=%d body=%s", resp.StatusCode, truncate(string(data), 160))
+	}
+	return nil
 }
 
 // fallbackDeviceID 兜底 Oai-Device-Id:用账号 ID 拼一个固定的 uuid-like 字符串,

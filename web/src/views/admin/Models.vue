@@ -64,7 +64,7 @@ const rules: FormRules = {
     { pattern: /^[A-Za-z][A-Za-z0-9._\-]{1,63}$/, message: '字母开头,2-64 位字母/数字/点/下划线/短横', trigger: 'blur' },
   ],
   type: [{ required: true, message: '请选择类型', trigger: 'change' }],
-  upstream_model_slug: [{ required: true, message: '上游 slug 必填', trigger: 'blur' }],
+  upstream_model_slug: [{ required: true, message: '模型映射 slug 必填', trigger: 'blur' }],
 }
 
 function openCreate() {
@@ -149,7 +149,7 @@ onMounted(load)
         <div>
           <h2 class="page-title" style="margin:0">模型配置</h2>
           <div style="color:var(--el-text-color-secondary);font-size:13px;margin-top:4px">
-            定义对外 slug 与上游模型的映射关系,设置每张图 / 每 1M tokens 的计费倍率;所有价格单位为"积分(厘)",保存后实时生效。
+            定义对外 slug 与实际模型的映射关系,设置每张图 / 每 1M tokens 的计费倍率;所有价格单位为"积分(厘)",保存后实时生效。
           </div>
         </div>
         <div class="flex-wrap-gap">
@@ -181,7 +181,7 @@ onMounted(load)
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="upstream_model_slug" label="上游 slug" min-width="170" show-overflow-tooltip>
+        <el-table-column prop="upstream_model_slug" label="模型映射 slug" min-width="170" show-overflow-tooltip>
           <template #default="{ row }"><code>{{ row.upstream_model_slug }}</code></template>
         </el-table-column>
         <el-table-column v-if="ENABLE_CHAT_MODEL" label="价目(chat)" min-width="220">
@@ -254,8 +254,8 @@ onMounted(load)
             <el-radio-button label="image">生图 image</el-radio-button>
           </el-radio-group>
         </el-form-item>
-        <el-form-item label="上游 slug" prop="upstream_model_slug">
-          <el-input v-model="form.upstream_model_slug" placeholder="上游 chatgpt.com 实际模型名" />
+        <el-form-item label="模型映射 slug" prop="upstream_model_slug">
+          <el-input v-model="form.upstream_model_slug" placeholder="实际模型名" />
         </el-form-item>
 
         <template v-if="form.type === 'chat'">

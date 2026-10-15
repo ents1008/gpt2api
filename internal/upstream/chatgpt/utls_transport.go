@@ -23,7 +23,7 @@ import (
 //
 // chatgpt.com 前置的 Cloudflare 会按 TLS ClientHello 的 JA3/JA4 指纹识别客户端;
 // Go 标准 crypto/tls 的指纹会被直接拒绝(返回 403 HTML 拦截页)。这里用
-// refraction-networking/utls 把 ClientHello 换成 Chrome 120 模板,让 Cloudflare
+// refraction-networking/utls 把 ClientHello 换成 Chrome 131 模板,让 Cloudflare
 // 认为是真 Chrome。
 //
 // 同时支持通过 HTTP(S) 代理走 CONNECT 隧道。
@@ -35,12 +35,21 @@ import (
 //
 // proxyURL 只支持 http/https,socks5 需要走另一条路径(当前账号池均为 HTTP 代理)。
 func NewUTLSTransport(proxyURL string, idleTimeout time.Duration) (http.RoundTripper, error) {
+	return newUTLSTransport(proxyURL, idleTimeout, nil)
+}
+
+func newUTLSTransport(
+	proxyURL string,
+	idleTimeout time.Duration,
+	trafficMeter *TrafficMeter,
+) (http.RoundTripper, error) {
 	if idleTimeout <= 0 {
 		idleTimeout = 30 * time.Second
 	}
 	rt := &utlsRoundTripper{
-		dialer:      &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second},
-		idleTimeout: idleTimeout,
+		dialer:       &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second},
+		idleTimeout:  idleTimeout,
+		trafficMeter: trafficMeter,
 	}
 	if strings.TrimSpace(proxyURL) != "" {
 		u, err := url.Parse(proxyURL)
@@ -76,21 +85,18 @@ func NewUTLSTransport(proxyURL string, idleTimeout time.Duration) (http.RoundTri
 
 // forceH1 如果为 true,ALPN 只请求 http/1.1 且 RoundTrip 完全跳过 h2。
 //
-// 为什么要这个开关:
-// chatgpt.com + Cloudflare 近期加强了 JA4H(HTTP/2 SETTINGS frame 指纹)识别。
-// Go 的 golang.org/x/net/http2.Transport 发出的 SETTINGS frame 顺序/参数跟
-// Chrome 不同,即使 TLS ClientHello 用 uTLS 伪装成 Chrome,h2 层依然会被识别
-// 为自动化客户端,触发"Unusual activity has been detected"硬风控。
-//
-// 参考实现 gen_image.py 用 curl-cffi(impersonate chrome131),那个库同时伪装
-// TLS + HTTP/2 指纹。本 transport 暂未接 tls-client,
-// 作为权宜之计:强制 http/1.1,上游对 h1 的指纹检测更宽松。
-var forceH1 = true
+// 默认必须优先走 HTTP/2:当前 Python image reference 通过 curl-cffi 的
+// 浏览器式 HTTP/2 路径可以完成 sentinel prepare/finalize,而强制 HTTP/1.1
+// 会让新 free 账号在 /backend-api/sentinel/chat-requirements/prepare 收到
+// 上游 403。保留该变量仅供 live debug 或紧急实验切换;正常路径依赖下面
+// RoundTrip 的 h2-first + 协议错误回退 h1。
+var forceH1 = false
 
 type utlsRoundTripper struct {
-	proxyURL    *url.URL
-	dialer      *net.Dialer
-	idleTimeout time.Duration
+	proxyURL     *url.URL
+	dialer       *net.Dialer
+	idleTimeout  time.Duration
+	trafficMeter *TrafficMeter
 
 	mu sync.Mutex
 	h1 *http.Transport
@@ -101,7 +107,7 @@ type utlsRoundTripper struct {
 //
 // 当 forceH1 = true 时,完全跳过 h2(避免 JA4H 识别),直接走 h1 transport。
 func (rt *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if forceH1 {
+	if forceH1 || !strings.EqualFold(req.URL.Scheme, "https") {
 		return rt.h1.RoundTrip(req)
 	}
 	// SSE / chunked body 场景:不能让 h2 transport 吃掉 Connection: close 之类的 h1 头
@@ -212,6 +218,9 @@ func (rt *utlsRoundTripper) dialRaw(ctx context.Context, addr string) (net.Conn,
 	if err != nil {
 		return nil, fmt.Errorf("dial proxy %s: %w", proxyAddr, err)
 	}
+	if rt.trafficMeter != nil {
+		conn = &meteredConn{Conn: conn, meter: rt.trafficMeter}
+	}
 	// HTTPS 代理本身要先 TLS 握手(走标准 tls,不需伪装指纹,代理一般不卡 JA3)。
 	// 部分商业代理使用私有 CA 或自签名证书,标准 CA 库无法验证;
 	// InsecureSkipVerify 只作用于「到代理服务器」这一段,不影响后续 uTLS 握手
@@ -260,6 +269,27 @@ func (rt *utlsRoundTripper) dialRaw(ctx context.Context, addr string) (net.Conn,
 		return &bufConn{Conn: conn, rd: bufio.NewReaderSize(io.MultiReader(peeked2Reader(peeked), conn), 4096)}, nil
 	}
 	return conn, nil
+}
+
+type meteredConn struct {
+	net.Conn
+	meter *TrafficMeter
+}
+
+func (conn *meteredConn) Read(buffer []byte) (int, error) {
+	count, err := conn.Conn.Read(buffer)
+	if count > 0 {
+		conn.meter.proxyReadBytes.Add(int64(count))
+	}
+	return count, err
+}
+
+func (conn *meteredConn) Write(buffer []byte) (int, error) {
+	count, err := conn.Conn.Write(buffer)
+	if count > 0 {
+		conn.meter.proxyWrittenBytes.Add(int64(count))
+	}
+	return count, err
 }
 
 // isH2Retryable 判断 h2 错误是否可以降级到 h1 重试。

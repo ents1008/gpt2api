@@ -10,10 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -24,40 +27,152 @@ import (
 
 func loggerL() *zap.Logger { return logger.L() }
 
-// 固定请求头(模拟 Chrome 124;客户端版本号可按需更新)。
+// 固定请求头和客户端版本号。浏览器画像定义在 browser_profile.go。
 const (
-	// UA 对齐 HAR 抓包(Edge 143 / Chromium 143 on Windows 11);必须与
-	// commonHeaders 里的 Sec-Ch-Ua-* 完整套件自洽,否则上游认为指纹冲突。
-	DefaultUserAgent      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
-	DefaultClientVersion  = "prod-be885abbfcfe7b1f511e88b3003d9ee44757fbad"
-	DefaultClientBuildNum = "5955942"
+	DefaultClientVersion  = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
+	DefaultClientBuildNum = "6708908"
 	DefaultLanguage       = "zh-CN"
 	BaseURL               = "https://chatgpt.com"
 )
 
 // Options 构造 Client 的参数。
 type Options struct {
-	BaseURL       string
-	AuthToken     string // 完整 Bearer token(已解密)
-	DeviceID      string
-	SessionID     string
-	ProxyURL      string        // http(s)://user:pass@host:port,为空则直连
-	Timeout       time.Duration // HTTP 总超时,默认 120s
-	SSETimeout    time.Duration // SSE 首 byte 超时,默认 60s
-	Cookies       string        // JSON 字符串(可选),格式 [{"name":"x","value":"y","domain":".chatgpt.com"}]
-	UserAgent     string
-	ClientVersion string
-	Language      string
+	BaseURL        string
+	AuthToken      string // 完整 Bearer token(已解密)
+	DeviceID       string
+	SessionID      string
+	ProxyURL       string        // http(s)://user:pass@host:port,为空则直连
+	Timeout        time.Duration // HTTP 总超时,默认 120s
+	SSETimeout     time.Duration // SSE 首 byte 超时,默认 60s
+	Cookies        string        // JSON 字符串(可选),格式 [{"name":"x","value":"y","domain":".chatgpt.com"}]
+	BrowserProfile string        // 注册浏览器采集的无凭据运行画像 JSON
+	ClientVersion  string
+	Language       string
+	TrafficMeter   *TrafficMeter
 
-	// TurnstileSolver 可选。为 nil 时 ChatRequirementsV2 会回退到单步
-	// chat-requirements 流程(TurnstileRequired=true 时直接忽略)。
+	// TurnstileSolver 可选。正常路径优先使用内置 SolveTurnstileToken(dx, p),
+	// 只有本地解释器返回空时才尝试外部 solver。
 	TurnstileSolver TurnstileSolver
 }
 
 // Client 一个账号/代理/device 一次请求的上游客户端。可多次复用(建议 1 次请求 1 个)。
 type Client struct {
-	opts Options
-	hc   *http.Client
+	opts          Options
+	hc            *http.Client
+	assetHC       *http.Client
+	bearerAssetHC *http.Client
+	profile       BrowserProfile
+}
+
+// TrafficSnapshot separates paid account-proxy tunnel bytes from direct image
+// body bytes. It is intended for isolated admission evidence; normal
+// production clients leave the meter nil and incur no atomic operations.
+type TrafficSnapshot struct {
+	ProxyReadBytes          int64 `json:"proxy_read_bytes"`
+	ProxyWrittenBytes       int64 `json:"proxy_written_bytes"`
+	DirectAssetReadBytes    int64 `json:"direct_asset_read_bytes"`
+	DirectAssetWrittenBytes int64 `json:"direct_asset_written_bytes"`
+}
+
+type TrafficCheckpoint struct {
+	Stage             string          `json:"stage"`
+	Traffic           TrafficSnapshot `json:"traffic"`
+	ResponseStatus    int             `json:"response_status,omitempty"`
+	SetCookieCount    int             `json:"set_cookie_count,omitempty"`
+	ContentEncoding   string          `json:"content_encoding,omitempty"`
+	ResponseBodyBytes int64           `json:"response_body_bytes,omitempty"`
+	ContentLength     int64           `json:"content_length,omitempty"`
+}
+
+type TrafficMeter struct {
+	proxyReadBytes          atomic.Int64
+	proxyWrittenBytes       atomic.Int64
+	directAssetReadBytes    atomic.Int64
+	directAssetWrittenBytes atomic.Int64
+	checkpointMu            sync.Mutex
+	checkpoints             []TrafficCheckpoint
+}
+
+func (meter *TrafficMeter) Snapshot() TrafficSnapshot {
+	if meter == nil {
+		return TrafficSnapshot{}
+	}
+	return TrafficSnapshot{
+		ProxyReadBytes:          meter.proxyReadBytes.Load(),
+		ProxyWrittenBytes:       meter.proxyWrittenBytes.Load(),
+		DirectAssetReadBytes:    meter.directAssetReadBytes.Load(),
+		DirectAssetWrittenBytes: meter.directAssetWrittenBytes.Load(),
+	}
+}
+
+func (meter *TrafficMeter) checkpoint(stage string) {
+	meter.checkpointResponse(stage, 0, 0, "", 0, 0)
+}
+
+func (meter *TrafficMeter) checkpointResponse(
+	stage string,
+	responseStatus int,
+	setCookieCount int,
+	contentEncoding string,
+	responseBodyBytes int64,
+	contentLength int64,
+) {
+	if meter == nil {
+		return
+	}
+	meter.checkpointMu.Lock()
+	meter.checkpoints = append(meter.checkpoints, TrafficCheckpoint{
+		Stage:             stage,
+		Traffic:           meter.Snapshot(),
+		ResponseStatus:    responseStatus,
+		SetCookieCount:    setCookieCount,
+		ContentEncoding:   contentEncoding,
+		ResponseBodyBytes: responseBodyBytes,
+		ContentLength:     contentLength,
+	})
+	meter.checkpointMu.Unlock()
+}
+
+func (meter *TrafficMeter) Checkpoints() []TrafficCheckpoint {
+	if meter == nil {
+		return nil
+	}
+	meter.checkpointMu.Lock()
+	defer meter.checkpointMu.Unlock()
+	return append([]TrafficCheckpoint(nil), meter.checkpoints...)
+}
+
+// TrafficSnapshot returns this client's current diagnostic counters. Normal
+// production clients have no meter and therefore return an all-zero snapshot.
+func (c *Client) TrafficSnapshot() TrafficSnapshot {
+	if c == nil {
+		return TrafficSnapshot{}
+	}
+	return c.opts.TrafficMeter.Snapshot()
+}
+
+func (c *Client) checkpointTraffic(stage string) {
+	if c != nil {
+		c.opts.TrafficMeter.checkpoint(stage)
+	}
+}
+
+func (c *Client) checkpointResponseTraffic(
+	stage string,
+	response *http.Response,
+	responseBodyBytes int64,
+) {
+	if c == nil || response == nil {
+		return
+	}
+	c.opts.TrafficMeter.checkpointResponse(
+		stage,
+		response.StatusCode,
+		len(response.Cookies()),
+		response.Header.Get("Content-Encoding"),
+		responseBodyBytes,
+		response.ContentLength,
+	)
 }
 
 // New 构造客户端。
@@ -77,22 +192,33 @@ func New(opt Options) (*Client, error) {
 	if opt.SSETimeout == 0 {
 		opt.SSETimeout = 60 * time.Second
 	}
-	if opt.UserAgent == "" {
-		opt.UserAgent = DefaultUserAgent
-	}
 	if opt.ClientVersion == "" {
 		opt.ClientVersion = DefaultClientVersion
 	}
 	if opt.Language == "" {
 		opt.Language = DefaultLanguage
 	}
+	profile := DefaultBrowserProfile()
+	if strings.TrimSpace(opt.BrowserProfile) != "" {
+		parsed, canonical, err := ParseBrowserProfileJSON(opt.BrowserProfile)
+		if err != nil {
+			return nil, err
+		}
+		profile = parsed
+		opt.BrowserProfile = canonical
+		opt.Language = profile.Language
+	}
 
 	// 直接用标准 net/http 会被 Cloudflare 按 JA3/JA4 指纹识别出不是浏览器(403 拦截页);
 	// 这里换成 utls-based RoundTripper,ClientHello 伪装成 Chrome 120。
 	// Proxy(HTTP / HTTPS CONNECT)在 transport 内部处理,不再走 http.ProxyURL。
-	tr, err := NewUTLSTransport(opt.ProxyURL, 30*time.Second)
+	tr, err := newUTLSTransport(opt.ProxyURL, 30*time.Second, opt.TrafficMeter)
 	if err != nil {
 		return nil, fmt.Errorf("init utls transport: %w", err)
+	}
+	bearerAssetTransport, err := newUTLSTransport("", 30*time.Second, nil)
+	if err != nil {
+		return nil, fmt.Errorf("init bearer asset transport: %w", err)
 	}
 
 	jar, _ := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
@@ -101,40 +227,40 @@ func New(opt Options) (*Client, error) {
 		Timeout:   opt.Timeout, // SSE 场景会关闭该 timeout(见 StreamConversation)
 		Jar:       jar,
 	}
-	if opt.Cookies != "" {
-		_ = loadCookies(jar, opt.BaseURL, opt.Cookies)
+	assetTransport := &http.Transport{
+		Proxy:                 nil,
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConnsPerHost:   4,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: time.Second,
 	}
-	return &Client{opts: opt, hc: hc}, nil
+	assetHC := &http.Client{Transport: assetTransport, Timeout: opt.Timeout}
+	bearerAssetHC := &http.Client{Transport: bearerAssetTransport, Timeout: opt.Timeout}
+	if opt.Cookies != "" {
+		if err := loadCookies(jar, opt.BaseURL, opt.Cookies); err != nil {
+			return nil, fmt.Errorf("load cookies: %w", err)
+		}
+	}
+	return &Client{
+		opts: opt, hc: hc, assetHC: assetHC, bearerAssetHC: bearerAssetHC, profile: profile,
+	}, nil
 }
 
-// loadCookies 把 JSON cookies 加载到 jar。
-func loadCookies(jar http.CookieJar, base, raw string) error {
-	var list []struct {
-		Name   string `json:"name"`
-		Value  string `json:"value"`
-		Domain string `json:"domain"`
-		Path   string `json:"path"`
+// CookieJSON returns the current ChatGPT cookie jar after bootstrap and other
+// upstream requests have applied Set-Cookie updates.
+func (c *Client) CookieJSON() (string, error) {
+	if c == nil || c.hc == nil {
+		return "", errors.New("chatgpt client is nil")
 	}
-	if err := json.Unmarshal([]byte(raw), &list); err != nil {
-		return err
-	}
-	u, err := url.Parse(base)
-	if err != nil {
-		return err
-	}
-	cs := make([]*http.Cookie, 0, len(list))
-	for _, c := range list {
-		if c.Name == "" || c.Value == "" {
-			continue
-		}
-		path := c.Path
-		if path == "" {
-			path = "/"
-		}
-		cs = append(cs, &http.Cookie{Name: c.Name, Value: c.Value, Domain: c.Domain, Path: path})
-	}
-	jar.SetCookies(u, cs)
-	return nil
+	return cookieJarJSON(c.hc.Jar, c.opts.BaseURL)
+}
+
+// UserAgent returns the browser UA used by this client and its PoW solver.
+func (c *Client) UserAgent() string {
+	return c.profile.UserAgent()
 }
 
 // commonHeaders 设置所有 chatgpt.com 请求通用的头。
@@ -149,24 +275,13 @@ func loadCookies(jar http.CookieJar, base, raw string) error {
 // forceH1 强制走 http/1.1 规避。
 func (c *Client) commonHeaders(req *http.Request) {
 	req.Header.Set("Authorization", "Bearer "+c.opts.AuthToken)
-	req.Header.Set("User-Agent", c.opts.UserAgent)
+	ApplyBrowserFingerprintHeaders(req.Header, c.profile)
 	req.Header.Set("Origin", c.opts.BaseURL)
 	req.Header.Set("Referer", c.opts.BaseURL+"/")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6")
 	// 不设置 Accept-Encoding:Go net/http 会自动加 `Accept-Encoding: gzip` 并透明解压。
 	// 若主动声明 br/zstd,Go 不会解压,body 会是压缩字节,SSE / JSON 解析全坏。
 	// sec-ch-ua 完整套件(Edge 143 on Windows 11):真实浏览器每次都会带这整套,
 	// 少其中任何一项都可能触发 bot 指纹识别。保持与 DefaultUserAgent 对齐。
-	req.Header.Set("Sec-Ch-Ua", `"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"`)
-	req.Header.Set("Sec-Ch-Ua-Arch", `"x86"`)
-	req.Header.Set("Sec-Ch-Ua-Bitness", `"64"`)
-	req.Header.Set("Sec-Ch-Ua-Full-Version", `"143.0.3650.96"`)
-	req.Header.Set("Sec-Ch-Ua-Full-Version-List",
-		`"Microsoft Edge";v="143.0.3650.96", "Chromium";v="143.0.7499.147", "Not A(Brand";v="24.0.0.0"`)
-	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
-	req.Header.Set("Sec-Ch-Ua-Model", `""`)
-	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
-	req.Header.Set("Sec-Ch-Ua-Platform-Version", `"19.0.0"`)
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
@@ -209,16 +324,24 @@ func (e *UpstreamError) Error() string {
 // IsRateLimited 对应 HTTP 429 / 资源耗尽。
 func (e *UpstreamError) IsRateLimited() bool { return e.Status == 429 }
 
-// IsUnauthorized 对应 401 / 403(token 失效 / 风控封号)。
-func (e *UpstreamError) IsUnauthorized() bool { return e.Status == 401 || e.Status == 403 }
+// IsUnauthorized 对应真正的鉴权失败。403 可能是风控/环境/阶段性拒绝,
+// 不能等同于 token 失效。
+func (e *UpstreamError) IsUnauthorized() bool { return e.Status == 401 }
+
+// IsForbidden 对应 HTTP 403。调用方应按可恢复异常降级/冷却,不要直接打 dead。
+func (e *UpstreamError) IsForbidden() bool { return e.Status == 403 }
 
 // ChatRequirementsResp 对应响应(仅摘取关键字段)。
 type ChatRequirementsResp struct {
 	Token string `json:"token"` // chat_token
+	// ProofToken / TurnstileToken 是本次 finalize 已经使用过的 sentinel token,
+	// 后续 f/conversation 请求必须复用同一组 token。
+	ProofToken     string `json:"-"`
+	TurnstileToken string `json:"-"`
+	SOToken        string `json:"-"`
 	// Persona 常见取值:"chatgpt-freeaccount"(免费号)/ "chatgpt-paid"(Plus/Team)
 	//              / "chatgpt-noauth"(未登录)
-	// 免费号对高级模型(gpt-5 等)会静默不生成,必须把 upstream model 退化到 "auto"
-	// 由上游自己挑,否则 SSE 只会拿到一条 hidden system preamble 就结束。
+	// 当前仅把 persona 暴露给上层做观测与日志,具体请求模型是否可用交由上游自行判定。
 	Persona     string `json:"persona"`
 	Proofofwork struct {
 		Required   bool   `json:"required"`
@@ -244,24 +367,20 @@ func (r *ChatRequirementsResp) SolveProof(userAgent string) string {
 	return SolveProofToken(r.Proofofwork.Seed, r.Proofofwork.Difficulty, userAgent)
 }
 
-// Bootstrap 模拟浏览器首次打开 chatgpt.com 的 GET /,让 cookie jar 收下
-// Cloudflare 的 `__cf_bm` / `_cfuvid` 与 OpenAI 的 `oai-did` 等 cookie。
+// Bootstrap 对 chatgpt.com 的 / 发起 HEAD,让 cookie jar 收下 Cloudflare 的
+// `__cf_bm` / `_cfuvid` 与 OpenAI 的 `oai-did` 等 cookie,但不下载未使用的首页正文。
 //
 // 关键作用:没有这些 cookie 时,chat-requirements 会直接要求 Turnstile(即使
 // Bearer 合法),所以建议在每次新建 Client 后先调一次 Bootstrap,或者在
 // ChatRequirements 内部第一次请求前自动调一次。
 // 多次调用是幂等的(HTTP 200/3xx 均视为成功)。
 func (c *Client) Bootstrap(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.opts.BaseURL+"/", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.opts.BaseURL+"/", nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", c.opts.UserAgent)
+	ApplyBrowserFingerprintHeaders(req.Header, c.profile)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6")
-	req.Header.Set("Sec-Ch-Ua", `"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"`)
-	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
-	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
 	req.Header.Set("Sec-Fetch-Dest", "document")
 	req.Header.Set("Sec-Fetch-Mode", "navigate")
 	req.Header.Set("Sec-Fetch-Site", "none")
@@ -269,12 +388,50 @@ func (c *Client) Bootstrap(ctx context.Context) error {
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
 	res, err := c.hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("bootstrap GET /: %w", err)
+		return fmt.Errorf("bootstrap HEAD /: %w", err)
 	}
 	defer res.Body.Close()
-	_, _ = io.Copy(io.Discard, res.Body)
+	bodyBytes, _ := io.Copy(io.Discard, res.Body)
+	c.checkpointResponseTraffic("requirements.bootstrap", res, bodyBytes)
 	if res.StatusCode >= 500 {
 		return &UpstreamError{Status: res.StatusCode, Message: "bootstrap failed"}
+	}
+	return nil
+}
+
+// SetLastUsedModelConfig 对齐 ChatGPT Web 的设置 PATCH,让 thinking 模型与强度在发消息前先落到用户配置。
+func (c *Client) SetLastUsedModelConfig(ctx context.Context, modelSlug, thinkingEffort string) error {
+	if strings.TrimSpace(modelSlug) == "" {
+		return errors.New("model_slug required")
+	}
+
+	q := url.Values{}
+	q.Set("model_slug", modelSlug)
+	if strings.TrimSpace(thinkingEffort) != "" {
+		q.Set("thinking_effort", thinkingEffort)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch,
+		c.opts.BaseURL+"/backend-api/settings/user_last_used_model_config?"+q.Encode(),
+		nil)
+	if err != nil {
+		return err
+	}
+	c.commonHeaders(req)
+	req.Header.Set("Accept", "*/*")
+
+	res, err := c.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	buf, _ := io.ReadAll(res.Body)
+	if res.StatusCode >= 400 {
+		return &UpstreamError{
+			Status:  res.StatusCode,
+			Message: "settings/user_last_used_model_config failed",
+			Body:    string(buf),
+		}
 	}
 	return nil
 }
@@ -289,7 +446,7 @@ func (c *Client) ChatRequirements(ctx context.Context) (*ChatRequirementsResp, e
 		// 拿不到 cookie 不致命,继续往下走;真不行再让 chat-requirements 自己报错。
 		_ = err
 	}
-	reqToken := NewPOWConfig(c.opts.UserAgent).RequirementsToken()
+	reqToken := NewPOWConfig(DefaultUserAgent).RequirementsToken()
 	body, _ := json.Marshal(map[string]string{"p": reqToken})
 	req, err := http.NewRequestWithContext(ctx,
 		http.MethodPost,
@@ -314,38 +471,24 @@ func (c *Client) ChatRequirements(ctx context.Context) (*ChatRequirementsResp, e
 	if err := json.Unmarshal(buf, &out); err != nil {
 		return nil, fmt.Errorf("decode chat-requirements: %w", err)
 	}
-	// 诊断用:打印完整 body(含 turnstile / proofofwork / arkose 字段)。
-	// 稳定后可改成 Debug 或删除。
 	if logger := loggerL(); logger != nil {
-		bodyStr := string(buf)
-		if len(bodyStr) > 800 {
-			bodyStr = bodyStr[:800] + "..."
-		}
-		logger.Info("chat-requirements raw body",
-			zap.String("body", bodyStr),
+		logger.Info("chat-requirements result",
+			zap.String("persona", out.Persona),
 			zap.Bool("turnstile_required", out.Turnstile.Required),
 			zap.Bool("pow_required", out.Proofofwork.Required),
-			zap.String("token_prefix", truncatePrefix(out.Token, 16)))
+			zap.Bool("has_token", out.Token != ""))
 	}
 	return &out, nil
-}
-
-func truncatePrefix(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }
 
 // ChatRequirementsPrepareResp 是 /sentinel/chat-requirements/prepare 的响应。
 //
 // 浏览器在每个 turn 前先调 prepare 拿到 challenge(turnstile.dx + pow.seed/difficulty),
-// 本地计算后再调 finalize 拿最终 chat-requirements-token。我们 Go 端没法解
-// turnstile(Cloudflare 混淆 JS + WASM),所以 solver 未配置时需要回退到老的
-// 单步 /sentinel/chat-requirements 端点(见 ChatRequirementsV2)。
+// 本地计算后再调 finalize 拿最终 chat-requirements-token。
 type ChatRequirementsPrepareResp struct {
 	Persona      string `json:"persona"`
 	PrepareToken string `json:"prepare_token"`
+	SourceP      string `json:"-"`
 	Turnstile    struct {
 		Required bool   `json:"required"`
 		DX       string `json:"dx"`
@@ -360,7 +503,7 @@ type ChatRequirementsPrepareResp struct {
 // ChatRequirementsPrepare 调 /backend-api/sentinel/chat-requirements/prepare。
 // 请求体里的 `p` 字段仍是 18 元素 PoW(前缀 gAAAAAC),和老的单步接口同款。
 func (c *Client) ChatRequirementsPrepare(ctx context.Context) (*ChatRequirementsPrepareResp, error) {
-	reqToken := NewPOWConfig(c.opts.UserAgent).RequirementsToken()
+	reqToken := NewPOWConfig(DefaultUserAgent).RequirementsToken()
 	body, _ := json.Marshal(map[string]string{"p": reqToken})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.opts.BaseURL+"/backend-api/sentinel/chat-requirements/prepare",
@@ -384,53 +527,51 @@ func (c *Client) ChatRequirementsPrepare(ctx context.Context) (*ChatRequirements
 	if err := json.Unmarshal(buf, &out); err != nil {
 		return nil, fmt.Errorf("decode chat-requirements/prepare: %w", err)
 	}
+	out.SourceP = reqToken
 	return &out, nil
 }
 
 // ChatRequirementsFinalize 调 /backend-api/sentinel/chat-requirements/finalize。
-// 入参:prepare_token(来自 Prepare),proofofwork(本地解,13 元素),
-// turnstileResp(通常由 TurnstileSolver 提供;没有则传空串,上游可能拒绝)。
+// 入参:prepare_token(来自 Prepare),proofToken(本地解,13 元素),
+// turnstileResp(由 SolveTurnstileToken 解出;没有则传空串,上游可能拒绝)。
 // 返回最终的 chat-requirements-token。
 func (c *Client) ChatRequirementsFinalize(
 	ctx context.Context,
-	prepareToken, proofofwork, turnstileResp string,
-) (string, string, error) {
+	prepareToken, proofToken, turnstileResp string,
+) (string, string, string, error) {
 	payload := map[string]interface{}{
-		"prepare_token": prepareToken,
-	}
-	if proofofwork != "" {
-		payload["proofofwork"] = proofofwork
-	}
-	if turnstileResp != "" {
-		payload["turnstile"] = turnstileResp
+		"prepare_token":   prepareToken,
+		"proof_token":     proofToken,
+		"turnstile_token": turnstileResp,
 	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.opts.BaseURL+"/backend-api/sentinel/chat-requirements/finalize",
 		strings.NewReader(string(body)))
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	c.commonHeaders(req)
 	req.Header.Set("Content-Type", "application/json")
 
 	res, err := c.hc.Do(req)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer res.Body.Close()
 	buf, _ := io.ReadAll(res.Body)
 	if res.StatusCode >= 400 {
-		return "", "", &UpstreamError{Status: res.StatusCode, Message: "chat-requirements/finalize failed", Body: string(buf)}
+		return "", "", "", &UpstreamError{Status: res.StatusCode, Message: "chat-requirements/finalize failed", Body: string(buf)}
 	}
 	var out struct {
 		Persona string `json:"persona"`
 		Token   string `json:"token"`
+		SOToken string `json:"so_token"`
 	}
 	if err := json.Unmarshal(buf, &out); err != nil {
-		return "", "", fmt.Errorf("decode chat-requirements/finalize: %w", err)
+		return "", "", "", fmt.Errorf("decode chat-requirements/finalize: %w", err)
 	}
-	return out.Token, out.Persona, nil
+	return out.Token, out.Persona, out.SOToken, nil
 }
 
 // ChatRequirementsV2 是 sentinel 协议的新统一入口。
@@ -439,71 +580,104 @@ func (c *Client) ChatRequirementsFinalize(
 //  1. 先调 /prepare 拿 challenge;
 //  2. 若返回 turnstile.required=false,直接把 prepare_token 走 finalize 拿最终 token;
 //  3. 若 turnstile.required=true:
-//     a. 当 opts.TurnstileSolver != nil → solver.Solve(dx),然后走 finalize;
-//     b. 当 solver 为 nil → **回退到老的单步 chat-requirements**,保持向后兼容。
+//     a. 优先用内置 SolveTurnstileToken(dx, prepare.p) 解算,然后走 finalize;
+//     b. 内置解算失败且 opts.TurnstileSolver != nil 时,再尝试外部 solver;
+//     c. 仍失败则直接返回错误,让调度器换号/冷却,不再回退旧单步协议拖成长轮询。
 //
 // 返回值与老的 ChatRequirements 保持一致,方便调用方无痛切换。
 //
-// 调用前请先 Bootstrap()。
+// ChatRequirementsV2 会先尝试 Bootstrap()。拿不到首页 cookie 不直接失败,继续让
+// sentinel 返回明确错误,避免把临时首页错误误判成鉴权失败。
 func (c *Client) ChatRequirementsV2(ctx context.Context) (*ChatRequirementsResp, error) {
-	prep, err := c.ChatRequirementsPrepare(ctx)
-	if err != nil {
-		// prepare 本身失败时,不再尝试 finalize,直接回退到单步接口。
-		// 这样新协议上游未开启时也不会阻塞业务。
-		if logger := loggerL(); logger != nil {
-			logger.Warn("chat-requirements/prepare failed, fallback to single-step",
-				zap.Error(err))
-		}
-		return c.ChatRequirements(ctx)
+	bootstrapErr := c.Bootstrap(ctx)
+	if bootstrapErr != nil {
+		// 和旧 ChatRequirements 保持一致:bootstrap 是浏览器状态预热,不是最终
+		// 鉴权判定。真正不可用由 prepare/finalize 返回的状态决定。
+		_ = bootstrapErr
 	}
 
-	// 组装回退用的伪 Resp(即使后面走 finalize,也要把这些字段透传出去)
+	prep, err := c.ChatRequirementsPrepare(ctx)
+	c.checkpointTraffic("requirements.prepare")
+	if err != nil {
+		if logger := loggerL(); logger != nil {
+			logger.Warn("chat-requirements/prepare failed",
+				zap.Error(err))
+		}
+		return nil, err
+	}
+
+	// 组装最终响应;即使后面走 finalize,也要把 challenge 描述透传出去。
 	resp := &ChatRequirementsResp{Persona: prep.Persona}
 	resp.Turnstile.Required = prep.Turnstile.Required
 	resp.Proofofwork.Required = prep.Proofofwork.Required
 	resp.Proofofwork.Seed = prep.Proofofwork.Seed
 	resp.Proofofwork.Difficulty = prep.Proofofwork.Difficulty
 
-	// 本地解 PoW(header 里用的 proof_token 与 finalize 里的 proofofwork 同款)
+	// 本地解 PoW;finalize 与后续 f/conversation header 复用同一个 proof_token。
 	var proof string
 	if prep.Proofofwork.Required {
-		proof = SolveProofToken(prep.Proofofwork.Seed, prep.Proofofwork.Difficulty, c.opts.UserAgent)
+		proof = SolveProofToken(prep.Proofofwork.Seed, prep.Proofofwork.Difficulty, DefaultUserAgent)
+		resp.ProofToken = proof
 	}
 
 	// Turnstile 路由
 	var turnstileResp string
 	if prep.Turnstile.Required {
-		if c.opts.TurnstileSolver != nil {
+		var solveDebug turnstileSolveDebug
+		turnstileResp, solveDebug = solveTurnstileToken(prep.Turnstile.DX, prep.SourceP)
+		if turnstileResp == "" && c.opts.TurnstileSolver != nil {
 			sCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
 			out, solveErr := c.opts.TurnstileSolver.Solve(sCtx, prep.Turnstile.DX)
 			if solveErr != nil || out == "" {
 				if logger := loggerL(); logger != nil {
-					logger.Warn("turnstile solver failed, fallback to single-step chat-requirements",
+					logger.Warn("turnstile external solver failed",
 						zap.Error(solveErr))
 				}
-				return c.ChatRequirements(ctx)
+			} else {
+				turnstileResp = out
 			}
-			turnstileResp = out
-		} else {
-			// 没配 solver,直接回退单步
-			if logger := loggerL(); logger != nil {
-				logger.Info("turnstile required but no solver configured, fallback to single-step")
-			}
-			return c.ChatRequirements(ctx)
 		}
+		if turnstileResp == "" {
+			if logger := loggerL(); logger != nil {
+				logger.Warn("turnstile solver returned empty",
+					zap.String("stage", solveDebug.Stage),
+					zap.String("encoding", solveDebug.Encoding),
+					zap.Int("dx_len", solveDebug.DXLen),
+					zap.Int("p_len", solveDebug.PLen),
+					zap.Int("decoded_len", solveDebug.DecodedLen),
+					zap.Int("instruction_count", solveDebug.InstructionCount),
+					zap.Int("executed_count", solveDebug.ExecutedCount),
+					zap.Int("recovered_count", solveDebug.RecoveredCount))
+			}
+			return nil, errors.New("turnstile solver returned empty")
+		}
+		if logger := loggerL(); logger != nil {
+			logger.Info("turnstile solver ok",
+				zap.String("encoding", solveDebug.Encoding),
+				zap.Int("dx_len", solveDebug.DXLen),
+				zap.Int("p_len", solveDebug.PLen),
+				zap.Int("decoded_len", solveDebug.DecodedLen),
+				zap.Int("instruction_count", solveDebug.InstructionCount),
+				zap.Int("executed_count", solveDebug.ExecutedCount),
+				zap.Int("recovered_count", solveDebug.RecoveredCount),
+				zap.Int("token_len", len(turnstileResp)))
+		}
+		resp.TurnstileToken = turnstileResp
 	}
 
 	// finalize 拿真正 token
-	token, persona, err := c.ChatRequirementsFinalize(ctx, prep.PrepareToken, proof, turnstileResp)
+	token, persona, soToken, err := c.ChatRequirementsFinalize(ctx, prep.PrepareToken, proof, turnstileResp)
+	c.checkpointTraffic("requirements.finalize")
 	if err != nil {
 		if logger := loggerL(); logger != nil {
-			logger.Warn("chat-requirements/finalize failed, fallback to single-step",
+			logger.Warn("chat-requirements/finalize failed",
 				zap.Error(err))
 		}
-		return c.ChatRequirements(ctx)
+		return nil, err
 	}
 	resp.Token = token
+	resp.SOToken = soToken
 	if persona != "" {
 		resp.Persona = persona
 	}
@@ -520,7 +694,8 @@ func (c *Client) ChatRequirementsV2(ctx context.Context) (*ChatRequirementsResp,
 
 // SSEEvent 单条 SSE 数据。
 type SSEEvent struct {
-	Event string
-	Data  []byte
-	Err   error
+	Event       string
+	Data        []byte
+	Err         error
+	ReadFailure SSEReadFailureClass
 }

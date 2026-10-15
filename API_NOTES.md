@@ -20,7 +20,7 @@ referer: https://chatgpt.com/                           # 或 /c/{conversation_i
 user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
              (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36
 oai-language: zh-CN
-oai-device-id: <UUID>                                   # 首次 GET / 后从 cookie 取
+oai-device-id: <UUID>                                   # 首次 HEAD / 后从 cookie 取
 oai-client-version: prod-be885abbfcfe7b1f511e88b3003d9ee44757fbad
 oai-client-build-number: 5955942
 ```

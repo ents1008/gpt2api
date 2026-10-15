@@ -60,7 +60,7 @@ export function nullVal(
 }
 
 /**
- * 把网关 / 计费 / 上游返回的英文 error_code 翻译成中文提示。
+ * 把网关 / 计费 / 图片服务返回的英文 error_code 翻译成中文提示。
  *
  * 英文 code 是稳定的机器标识(写进 DB / 返回给 OpenAI 客户端,不会改动),
  * 前端在展示时做一次映射,人类可读。
@@ -96,12 +96,16 @@ const ERROR_CODE_LABEL: Record<string, string> = {
   image_not_wired: '图片能力未接入,请联系管理员',
   feature_disabled: '该功能已被管理员关闭',
 
-  // 上游
-  upstream_error: '上游服务返回错误',
-  upstream_timeout: '上游响应超时',
-  upstream_unavailable: '上游暂不可用',
-  account_exhausted: '账号池暂无可用账号,请稍后重试',
-  account_cooldown: '账号冷却中,请稍后重试',
+  // 图片服务
+  service_error: '图片服务返回错误',
+  service_timeout: '图片服务响应超时',
+  service_unavailable: '图片服务暂不可用',
+  service_init_error: '图片服务初始化失败',
+  upstream_error: '图片服务返回错误',
+  upstream_timeout: '图片服务响应超时',
+  upstream_unavailable: '图片服务暂不可用',
+  account_exhausted: '图片服务繁忙,请稍后重试',
+  account_cooldown: '图片服务冷却中,请稍后重试',
   proxy_unhealthy: '代理不健康',
 
   // 其它
@@ -113,4 +117,121 @@ const ERROR_CODE_LABEL: Record<string, string> = {
 export function formatErrorCode(code?: string | null): string {
   if (!code) return ''
   return ERROR_CODE_LABEL[code] || code
+}
+
+const IMAGE_ERROR_LABEL: Record<string, string> = {
+  content_policy_rejected: '提示词可能违反内容安全策略,请修改后重试',
+  image_assistant_reply: '图像助手回复',
+  image_async_error: '图片生成任务返回错误',
+  conversation_poll_error: '图片任务状态查询异常,请重试',
+  image_task_stalled: '图片任务未返回结果,请重试',
+  image_tool_without_asset: '图片生成未返回可用图片,请重试',
+  turnstile_stalled: '图片服务验证卡住,请稍后重试',
+  free_account_stalled: '图片任务未返回结果,请稍后重试',
+  no_available_account: '图片服务繁忙,请稍后重试',
+  rate_limited: '图片服务请求过于频繁,请稍后再试',
+  auth_required: '图片服务授权状态异常,请稍后重试',
+  network_transient: '图片服务网络波动,请重试',
+  pow_timeout: '图片服务验证超时,请稍后重试',
+  pow_failed: '图片服务验证失败,请稍后重试',
+  turnstile_required: '图片服务验证未通过,请稍后重试',
+  download_failed: '图片下载地址生成失败,请重试',
+  upstream_error: '图片服务返回错误',
+  service_error: '图片服务返回错误',
+}
+
+const IMAGE_ASSISTANT_REPLY_GENERIC = '图片生成未启动,请换一种描述重新生成'
+const IMAGE_LABEL_ONLY_CODES = new Set([
+  'auth_required',
+  'no_available_account',
+  'rate_limited',
+  'network_transient',
+  'pow_timeout',
+  'pow_failed',
+  'turnstile_required',
+  'conversation_poll_error',
+  'image_task_stalled',
+  'image_tool_without_asset',
+  'turnstile_stalled',
+  'free_account_stalled',
+  'download_failed',
+])
+
+function splitStoredImageError(raw: string): { code: string; detail: string } {
+  const idx = raw.indexOf(':')
+  if (idx <= 0) return { code: '', detail: raw.trim() }
+  const code = raw.slice(0, idx).trim()
+  if (!/^[a-z][a-z0-9_]*$/i.test(code)) {
+    return { code: '', detail: raw.trim() }
+  }
+  return { code, detail: raw.slice(idx + 1).trim() }
+}
+
+function cleanImageErrorDetail(detail: string): string {
+  return detail
+    .replace(/chatgpt-freeaccount/gi, '图片服务')
+    .replace(/chatgpt/gi, '图片服务')
+    .replace(/upstream/gi, '服务')
+    .replace(/上游/g, '服务')
+    .replace(/账号池/g, '服务资源')
+    .replace(/当前账号/g, '当前服务资源')
+    .replace(/免费账号/g, '服务资源')
+    .trim()
+}
+
+function compactText(s: string, max = 90): string {
+  const oneLine = s.replace(/\s+/g, ' ').trim()
+  if (oneLine.length <= max) return oneLine
+  return `${oneLine.slice(0, max)}...`
+}
+
+function isJSONLikeText(s: string): boolean {
+  const v = s.trim()
+  return (
+    (v.startsWith('{') && v.endsWith('}')) ||
+    (v.startsWith('[') && v.endsWith(']')) ||
+    /^\{?\s*"prompt"\s*:/i.test(v)
+  )
+}
+
+/** 图片任务失败原因的用户侧短展示。原始 error 可放 title/tooltip 保留排障信息。 */
+export function formatImageTaskError(error?: string | null): string {
+  const raw = String(error || '').trim()
+  if (!raw) return '图片生成失败,请重试'
+  if (raw.startsWith('图像助手回复')) {
+    return compactText(cleanImageErrorDetail(raw))
+  }
+  if (raw.startsWith('提示词可能违反') || raw.startsWith('提示词触发内容安全')) {
+    return IMAGE_ERROR_LABEL.content_policy_rejected
+  }
+  if (raw.startsWith('图片生成未启动')) {
+    const idx = raw.indexOf(':')
+    const detail = idx >= 0 ? raw.slice(idx + 1).trim() : ''
+    if (!detail || isJSONLikeText(detail)) return IMAGE_ASSISTANT_REPLY_GENERIC
+    return `${IMAGE_ERROR_LABEL.image_assistant_reply}:${compactText(cleanImageErrorDetail(detail))}`
+  }
+
+  const { code, detail } = splitStoredImageError(raw)
+  const label = code ? (IMAGE_ERROR_LABEL[code] || ERROR_CODE_LABEL[code] || code) : ''
+  const publicDetail = cleanImageErrorDetail(detail)
+
+  if (code === 'content_policy_rejected') {
+    return IMAGE_ERROR_LABEL.content_policy_rejected
+  }
+  if (code === 'image_assistant_reply') {
+    if (!publicDetail || isJSONLikeText(publicDetail)) {
+      return IMAGE_ASSISTANT_REPLY_GENERIC
+    }
+    return `${IMAGE_ERROR_LABEL.image_assistant_reply}:${compactText(publicDetail)}`
+  }
+  if (code && IMAGE_LABEL_ONLY_CODES.has(code)) {
+    return label
+  }
+  if (label) {
+    if (!publicDetail || publicDetail === code || isJSONLikeText(publicDetail)) return label
+    return `${label}:${compactText(publicDetail)}`
+  }
+
+  const cleaned = cleanImageErrorDetail(raw)
+  return compactText(cleaned || '图片生成失败,请重试')
 }

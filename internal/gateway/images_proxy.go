@@ -25,7 +25,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -54,6 +56,13 @@ type ImageAccountResolver interface {
 
 // ImageProxyTTL 单条签名 URL 的默认有效期(24h,够前端离线展示一段时间)。
 const ImageProxyTTL = imageproxy.TTL
+
+func effectiveImageProxyURL(proxyURL string) string {
+	if strings.TrimSpace(proxyURL) != "" {
+		return proxyURL
+	}
+	return strings.TrimSpace(os.Getenv("GPT2API_FORCE_PROXY_URL"))
+}
 
 // BuildImageProxyURL 生成代理 URL。返回绝对 path(不含 host),调用方可以直接拼或交给前端同 origin 使用。
 func BuildImageProxyURL(taskID string, idx int, ttl time.Duration) string {
@@ -101,46 +110,6 @@ func (h *ImagesHandler) ImageProxy(c *gin.Context) {
 		return
 	}
 	ref := fids[idx] // 可能是 "sed:xxxx" 或 "xxxx"
-	if t.AccountID == 0 || h.ImageAccResolver == nil {
-		c.AbortWithStatus(http.StatusServiceUnavailable)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
-	defer cancel()
-
-	at, deviceID, cookies, err := h.ImageAccResolver.AuthToken(ctx, t.AccountID)
-	if err != nil {
-		logger.L().Warn("image proxy resolve account",
-			zap.Error(err), zap.Uint64("account_id", t.AccountID))
-		c.AbortWithStatus(http.StatusBadGateway)
-		return
-	}
-	proxyURL := h.ImageAccResolver.ProxyURL(ctx, t.AccountID)
-
-	cli, err := chatgpt.New(chatgpt.Options{
-		AuthToken: at,
-		DeviceID:  deviceID,
-		ProxyURL:  proxyURL,
-		Cookies:   cookies,
-		Timeout:   h.upstreamTimeout(),
-	})
-	if err != nil {
-		logger.L().Warn("image proxy build client", zap.Error(err))
-		c.AbortWithStatus(http.StatusBadGateway)
-		return
-	}
-
-	signedURL, err := cli.ImageDownloadURL(ctx, t.ConversationID, ref)
-	if err != nil {
-		logger.L().Warn("image proxy download_url",
-			zap.Error(err), zap.String("task_id", taskID), zap.String("ref", ref))
-		c.AbortWithStatus(http.StatusBadGateway)
-		return
-	}
-
-	// 按需放大:若 task 上打了 upscale 标记,先走进程内 LRU,命中则直接返回。
-	// 未命中再拉原图,放大成 PNG 后写入缓存。
 	scale := image.ValidateUpscale(t.Upscale)
 	cacheKey := ""
 	if scale != "" {
@@ -153,12 +122,72 @@ func (h *ImagesHandler) ImageProxy(c *gin.Context) {
 		}
 	}
 
-	body, ct, err := cli.FetchImage(ctx, signedURL, 16*1024*1024)
-	if err != nil {
-		logger.L().Warn("image proxy fetch",
-			zap.Error(err), zap.String("task_id", taskID))
-		c.AbortWithStatus(http.StatusBadGateway)
-		return
+	var body []byte
+	var ct string
+	if cachedBody, cachedCT, ok := image.GetVerifiedImage(taskID, idx, ref); ok {
+		body = cachedBody
+		ct = cachedCT
+	}
+	if len(body) == 0 {
+		if t.AccountID == 0 || h.ImageAccResolver == nil {
+			c.AbortWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+		defer cancel()
+
+		at, deviceID, cookies, err := h.ImageAccResolver.AuthToken(ctx, t.AccountID)
+		if err != nil {
+			logger.L().Warn("image proxy resolve account",
+				zap.Error(err), zap.Uint64("account_id", t.AccountID))
+			c.AbortWithStatus(http.StatusBadGateway)
+			return
+		}
+		proxyURL := effectiveImageProxyURL(h.ImageAccResolver.ProxyURL(ctx, t.AccountID))
+		if proxyURL == "" {
+			logger.L().Warn("image proxy missing account proxy",
+				zap.String("task_id", taskID), zap.Uint64("account_id", t.AccountID))
+			c.AbortWithStatus(http.StatusBadGateway)
+			return
+		}
+
+		cli, err := chatgpt.New(chatgpt.Options{
+			AuthToken: at,
+			DeviceID:  deviceID,
+			ProxyURL:  proxyURL,
+			Cookies:   cookies,
+			Timeout:   h.upstreamTimeout(),
+		})
+		if err != nil {
+			logger.L().Warn("image proxy build client", zap.Error(err))
+			c.AbortWithStatus(http.StatusBadGateway)
+			return
+		}
+
+		signedURL, err := cli.ImageDownloadURL(ctx, t.ConversationID, ref)
+		if err != nil {
+			logger.L().Warn("image proxy download_url",
+				zap.Error(err),
+				zap.String("task_id", taskID),
+				zap.String("ref", ref),
+				zap.Uint64("account_id", t.AccountID),
+				zap.Bool("proxy_bound", proxyURL != ""))
+			c.AbortWithStatus(http.StatusBadGateway)
+			return
+		}
+
+		body, ct, err = cli.FetchImage(ctx, signedURL, 16*1024*1024)
+		if err != nil {
+			logger.L().Warn("image proxy fetch",
+				zap.Error(err),
+				zap.String("task_id", taskID),
+				zap.Uint64("account_id", t.AccountID),
+				zap.Bool("proxy_bound", proxyURL != ""))
+			c.AbortWithStatus(http.StatusBadGateway)
+			return
+		}
+		image.PutVerifiedImage(taskID, idx, ref, body, ct)
 	}
 	if ct == "" {
 		ct = "image/png"

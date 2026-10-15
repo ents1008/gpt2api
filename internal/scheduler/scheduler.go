@@ -1,17 +1,17 @@
 // Package scheduler 负责 chatgpt.com 账号的并发安全调度。
 //
 // 核心规则(参考 RISK_AND_SAAS.md):
-//   1. 一号一锁:同账号同时只允许 1 个请求占用(Redis SETNX)。
-//   2. 最小间隔:同账号相邻请求 >= min_interval_sec。
-//   3. 每日配额:today_used_count < daily_image_quota * daily_usage_ratio。
-//   4. 状态机:healthy -> warned -> throttled -> suspicious -> dead,冷却过期自动恢复。
-//   5. 选择策略:status=healthy + cooldown 到期 + last_used_at 最早的优先。
+//  1. 一号一锁:同账号同时只允许 1 个请求占用(Redis SETNX)。
+//  2. 最小间隔:同账号相邻请求 >= min_interval_sec。
+//  3. 状态机:healthy -> warned -> throttled -> suspicious -> dead,冷却过期自动恢复。
+//  4. 选择策略:status=healthy + cooldown 到期 + last_used_at 最早的优先。
 package scheduler
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,15 +30,33 @@ var ErrNoAvailable = errors.New("scheduler: no available account")
 
 // Lease 代表一次账号占用的租约。
 type Lease struct {
-	Account     *account.Account
-	AuthToken   string // 已解密
-	ProxyURL    string // 已带密码
-	ProxyID     uint64
-	DeviceID    string
-	SessionID   string // oai_session_id(按账号稳定)
-	lockKey     string
-	lockToken   string
-	releaseFunc func(context.Context) error
+	Account            *account.Account
+	AuthToken          string // 已解密
+	ProxyURL           string // 已带密码
+	ProxyID            uint64
+	DeviceID           string
+	SessionID          string // oai_session_id(按账号稳定)
+	Cookies            string // JSON cookies,可选;用于复用账号注册/浏览器会话
+	BrowserProfile     string // 账号注册浏览器的无凭据运行画像
+	lockKey            string
+	lockToken          string
+	persistCookiesFunc func(context.Context, string) error
+	releaseFunc        func(context.Context) error
+}
+
+// PersistCookies commits the browser cookie snapshot while this lease still
+// owns the account lock. Callers should invoke it before Release.
+func (l *Lease) PersistCookies(ctx context.Context, raw string) error {
+	if strings.TrimSpace(raw) == "" || raw == l.Cookies {
+		return nil
+	}
+	if l.persistCookiesFunc != nil {
+		if err := l.persistCookiesFunc(ctx, raw); err != nil {
+			return err
+		}
+		l.Cookies = raw
+	}
+	return nil
 }
 
 // Release 释放锁并更新账号 last_used_at / today_used。
@@ -125,6 +143,9 @@ func (s *Scheduler) warnedPause() time.Duration {
 	}
 	return time.Duration(s.cfg.WarnedPauseHours) * time.Hour
 }
+func (s *Scheduler) suspiciousPause() time.Duration {
+	return s.cooldown429()
+}
 
 // queueWait 拿不到账号时的最长排队等待时间。
 // 返回 0 表示关闭排队(立即返回 ErrNoAvailable)。
@@ -141,7 +162,7 @@ func (s *Scheduler) queueWait() time.Duration {
 //
 // 语义(一号一任务 + 排队):
 //   - 同账号同时只允许 1 个请求持有 Redis 锁(acct:lock:{id},SETNX+TTL)。
-//   - 扫一遍所有 candidate 都被锁住 / 不满足 min_interval / 日配额时,
+//   - 扫一遍所有 candidate 都被锁住 / 不满足 min_interval 时,
 //     不立即返回失败,而是按指数退避轮询重试,直到拿到锁或超过 queueWait。
 //   - queueWait=0 时退化为老语义(扫一次,失败即返回 ErrNoAvailable)。
 func (s *Scheduler) Dispatch(ctx context.Context, modelType string) (*Lease, error) {
@@ -197,7 +218,7 @@ func (s *Scheduler) Dispatch(ctx context.Context, modelType string) (*Lease, err
 }
 
 // tryDispatchOnce 扫一遍 candidate,尝试为其中一个加锁;
-// 全部 candidate 都被锁 / 不满足 min_interval / 日配额时返回 ErrNoAvailable。
+// 全部 candidate 都被锁 / 不满足 min_interval 时返回 ErrNoAvailable。
 func (s *Scheduler) tryDispatchOnce(ctx context.Context, modelType string) (*Lease, error) {
 	limit := 30
 	dao := s.accSvc.DAO()
@@ -213,21 +234,18 @@ func (s *Scheduler) tryDispatchOnce(ctx context.Context, modelType string) (*Lea
 	minInterval := time.Duration(s.cfg.MinIntervalSec) * time.Second
 
 	for _, acc := range candidates {
-		if acc.LastUsedAt.Valid && now.Sub(acc.LastUsedAt.Time) < minInterval {
+		if shouldSkipDispatchCandidate(acc, now, minInterval) {
 			continue
-		}
-		if acc.DailyImageQuota > 0 {
-			usedToday := 0
-			if acc.TodayUsedDate.Valid && sameDay(acc.TodayUsedDate.Time, now) {
-				usedToday = acc.TodayUsedCount
-			}
-			max := int(float64(acc.DailyImageQuota) * s.dailyUsageRatio())
-			if max > 0 && usedToday >= max {
-				continue
-			}
 		}
 		lease, err := s.tryLock(ctx, acc)
 		if err == nil {
+			if shouldSkipLeaseForMissingProxy(modelType, lease.ProxyURL) {
+				logger.L().Warn("scheduler image account missing proxy binding",
+					zap.Uint64("account_id", acc.ID))
+				s.markImageAccountMissingProxy(ctx, acc.ID)
+				_ = lease.Release(ctx)
+				continue
+			}
 			return lease, nil
 		}
 		if errors.Is(err, lock.ErrNotAcquired) {
@@ -238,6 +256,29 @@ func (s *Scheduler) tryDispatchOnce(ctx context.Context, modelType string) (*Lea
 			zap.Uint64("account_id", acc.ID), zap.Error(err))
 	}
 	return nil, ErrNoAvailable
+}
+
+func shouldSkipDispatchCandidate(acc *account.Account, now time.Time, minInterval time.Duration) bool {
+	if acc == nil {
+		return true
+	}
+	return acc.LastUsedAt.Valid && now.Sub(acc.LastUsedAt.Time) < minInterval
+}
+
+func shouldSkipLeaseForMissingProxy(modelType, proxyURL string) bool {
+	return modelType == "image" && strings.TrimSpace(proxyURL) == ""
+}
+
+func missingProxyBindingPauseUntil(now time.Time) time.Time {
+	return now.Add(24 * time.Hour)
+}
+
+func (s *Scheduler) markImageAccountMissingProxy(ctx context.Context, accountID uint64) {
+	if s == nil || s.accSvc == nil || accountID == 0 {
+		return
+	}
+	pauseUntil := missingProxyBindingPauseUntil(time.Now())
+	_ = s.accSvc.DAO().SetStatusReason(ctx, accountID, account.StatusThrottled, &pauseUntil, "missing_proxy_binding")
 }
 
 func (s *Scheduler) tryLock(ctx context.Context, acc *account.Account) (*Lease, error) {
@@ -293,17 +334,27 @@ func (s *Scheduler) tryLock(ctx context.Context, acc *account.Account) (*Lease, 
 			}
 		}
 	}
+	cookies, err := s.accSvc.DecryptCookies(ctx, acc.ID)
+	if err != nil {
+		logger.L().Warn("scheduler decrypt account cookies failed",
+			zap.Uint64("account_id", acc.ID), zap.Error(err))
+	}
 
 	accCopy := acc
 	lease := &Lease{
-		Account:   accCopy,
-		AuthToken: authToken,
-		ProxyURL:  proxyURL,
-		ProxyID:   proxyID,
-		DeviceID:  deviceID,
-		SessionID: sessionID,
-		lockKey:   key,
-		lockToken: token,
+		Account:        accCopy,
+		AuthToken:      authToken,
+		ProxyURL:       proxyURL,
+		ProxyID:        proxyID,
+		DeviceID:       deviceID,
+		SessionID:      sessionID,
+		Cookies:        cookies,
+		BrowserProfile: acc.BrowserProfile,
+		lockKey:        key,
+		lockToken:      token,
+	}
+	lease.persistCookiesFunc = func(c context.Context, raw string) error {
+		return s.accSvc.StoreCookies(c, accCopy.ID, raw)
 	}
 	lease.releaseFunc = func(c context.Context) error {
 		today := truncateDay(time.Now())
@@ -315,7 +366,15 @@ func (s *Scheduler) tryLock(ctx context.Context, acc *account.Account) (*Lease, 
 
 // MarkRateLimited 上游 429:标记账号冷却并降级状态。
 func (s *Scheduler) MarkRateLimited(ctx context.Context, accountID uint64) {
-	cooldown := time.Now().Add(s.cooldown429())
+	s.MarkRateLimitedFor(ctx, accountID, s.cooldown429())
+}
+
+// MarkRateLimitedFor 标记账号按上游明确 reset 时间冷却。
+func (s *Scheduler) MarkRateLimitedFor(ctx context.Context, accountID uint64, cooldownFor time.Duration) {
+	if cooldownFor <= 0 {
+		cooldownFor = s.cooldown429()
+	}
+	cooldown := time.Now().Add(cooldownFor)
 	_ = s.accSvc.DAO().SetStatus(ctx, accountID, account.StatusThrottled, &cooldown)
 }
 
@@ -325,15 +384,49 @@ func (s *Scheduler) MarkWarned(ctx context.Context, accountID uint64) {
 	_ = s.accSvc.DAO().SetStatus(ctx, accountID, account.StatusWarned, &pause)
 }
 
-// MarkDead 账号彻底不可用(403/token 失效)。
-func (s *Scheduler) MarkDead(ctx context.Context, accountID uint64) {
-	_ = s.accSvc.DAO().SetStatus(ctx, accountID, account.StatusDead, nil)
+// MarkSuspicious 标记账号遇到可恢复的风控/环境异常,冷却后可由恢复流程重新确认。
+func (s *Scheduler) MarkSuspicious(ctx context.Context, accountID uint64, reason string) {
+	pause := time.Now().Add(s.suspiciousPauseForReason(reason))
+	_ = s.accSvc.DAO().SetStatusReason(ctx, accountID, account.StatusSuspicious, &pause, reason)
 }
 
-// RestoreHealthy 调度成功后回归健康(仅对 throttled 且冷却到期有效,
-// 简单起见此处不强检查,由管理员按需恢复)。
+func (s *Scheduler) suspiciousPauseForReason(reason string) time.Duration {
+	switch strings.TrimSpace(reason) {
+	case "upstream_403",
+		"proxy_connect_403",
+		"turnstile_stalled":
+		return 2 * time.Hour
+	case "upstream_network_transient",
+		"download_failed",
+		"poll_timeout",
+		"conversation_poll_error",
+		"image_task_stalled",
+		"image_tool_without_asset",
+		"free_account_stalled",
+		"pow_timeout",
+		"pow_failed",
+		"image_async_transient":
+		return 30 * time.Minute
+	default:
+		return s.suspiciousPause()
+	}
+}
+
+// MarkDead 账号彻底不可用。
+func (s *Scheduler) MarkDead(ctx context.Context, accountID uint64) {
+	s.MarkDeadWithReason(ctx, accountID, "mark_dead")
+}
+
+// MarkDeadWithReason 账号彻底不可用,并记录机器可读原因。
+func (s *Scheduler) MarkDeadWithReason(ctx context.Context, accountID uint64, reason string) {
+	_ = s.accSvc.DAO().SetStatusReason(ctx, accountID, account.StatusDead, nil, reason)
+}
+
+// RestoreHealthy 调度成功后回归健康。这里只恢复 suspicious 账号:
+// 成功出图能证明 403/上传超时这类临时异常已恢复,但不能证明 dead/RT
+// 失效或长期 throttled 的根因已经消失。
 func (s *Scheduler) RestoreHealthy(ctx context.Context, accountID uint64) {
-	_ = s.accSvc.DAO().SetStatus(ctx, accountID, account.StatusHealthy, nil)
+	_ = s.accSvc.DAO().RestoreHealthy(ctx, accountID)
 }
 
 // ------ helpers ------

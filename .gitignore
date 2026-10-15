@@ -8,6 +8,7 @@
 *.test
 *.out
 /bin/
+/build/
 /dist/
 /deploy/bin/
 
@@ -62,6 +63,20 @@ venv/
 *.tar.gz
 /_tmp/
 /tmp/
+/temp/*-linux-amd64*
+/temp/*-windows-amd64*
+/temp/*.exe
+/temp/deploy/
+/temp/deploy-fingerprint-continuity/
+/temp/direct-*
+/temp/isolated-*
+/temp/oauth-*
+/temp/session_probe-linux-amd64
+/temp/attachment_probe-linux-amd64
+/temp/live_prepare_probe-linux-amd64
+/temp/account-candidates-linux-amd64
+/temp/gpt2api-linux-amd64*
+/temp/image-acceptance-phase-meter-linux-amd64
 
 # 历史部署产物(运维自己 build 即可,不要带进仓库)
 /deploy/bin/

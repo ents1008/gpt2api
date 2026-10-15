@@ -1,12 +1,12 @@
 // Package gateway 实现 OpenAI 兼容的 /v1/* 入口。
 //
 // 职责:
-//   1. 鉴权(API Key,IP/模型白名单)
-//   2. 查模型 → 预扣积分
-//   3. 通过调度器拿账号 Lease
-//   4. 转译请求体 → 调用 chatgpt.com 上游
-//   5. 转译响应(流式 or 聚合) → OpenAI 协议
-//   6. 结算(真实 tokens) / 失败退款 / 释放账号锁 / 更新风控状态
+//  1. 鉴权(API Key,IP/模型白名单)
+//  2. 查模型 → 预扣积分
+//  3. 通过调度器拿账号 Lease
+//  4. 转译请求体 → 调用 chatgpt.com 上游
+//  5. 转译响应(流式 or 聚合) → OpenAI 协议
+//  6. 结算(真实 tokens) / 失败退款 / 释放账号锁 / 更新风控状态
 package gateway
 
 import (
@@ -44,9 +44,6 @@ type Handler struct {
 	Groups    *user.GroupCache
 	Limiter   *ratelimit.Limiter
 	Usage     *usage.Logger
-	AccSvc    interface {
-		DecryptCookies(ctx context.Context, accountID uint64) (string, error)
-	}
 	// Images 可选:若挂载,chat/completions 里指定图像模型会自动转派。
 	Images *ImagesHandler
 
@@ -88,6 +85,12 @@ func mapUpstreamModelSlug(s string) string {
 	case "gpt-5":
 		// HAR 抓包(2026-04,paid 账号,Edge 143)实证
 		return "gpt-5-3"
+	case "gpt-5.2":
+		return "gpt-5-2"
+	case "gpt-5.4":
+		return "gpt-5-4"
+	case "gpt-5.5":
+		return "gpt-5-5"
 	default:
 		return s
 	}
@@ -252,38 +255,30 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	defer func() { _ = lease.Release(context.Background()) }()
 
 	// 5) 构造上游 client
-	cookies, _ := h.AccSvc.DecryptCookies(c.Request.Context(), lease.Account.ID)
 	cli, err := chatgpt.New(chatgpt.Options{
 		AuthToken: lease.AuthToken,
 		DeviceID:  lease.DeviceID,
 		SessionID: lease.SessionID,
 		ProxyURL:  lease.ProxyURL,
-		Cookies:   cookies,
+		Cookies:   lease.Cookies,
 		Timeout:   h.upstreamTimeout(),
 	})
 	if err != nil {
 		refund("upstream_init_error")
-		openAIError(c, http.StatusInternalServerError, "upstream_init_error", "上游客户端初始化失败:"+err.Error())
+		openAIError(c, http.StatusInternalServerError, "upstream_init_error", "服务客户端初始化失败:"+err.Error())
 		return
 	}
+	defer persistGatewayLeaseCookies(lease, cli)
 
 	upstreamModel := m.UpstreamModelSlug
 	if upstreamModel == "" {
 		upstreamModel = "auto"
 	}
-	// Model slug 兜底映射:chatgpt.com 后端识别的是"灰度构建版本号",不是
-	// 通用品牌名。HAR 抓包(2026-04 paid 账号)显示浏览器实际发送的 slug:
-	//   品牌名 "GPT-5"   →  真实 slug "gpt-5-3"
-	//   品牌名 "GPT-5 Thinking" → "gpt-5-t-3" (待证实)
-	// 直接发裸的 "gpt-5" 会被上游识别为非标准客户端,下发一条
-	// is_visually_hidden_from_conversation=true 的空 system message(silent
-	// rejection)。这里做一次自动改写,避免运维每次灰度版本号变动都要改表。
-	// 管理员若在 models.upstream_model_slug 直接填了带版本号的 slug(如
-	// "gpt-5-3"),本映射是 no-op。
-	upstreamModel = mapUpstreamModelSlug(upstreamModel)
+	target := resolveUpstreamChatTarget(upstreamModel, req.Reasoning)
+	upstreamModel = target.Model
 
 	// 对齐 Python 参考实现(gen_image.py,已验证可用)的真实顺序:
-	//   (a) Bootstrap GET /                  —— 拿 __cf_bm / oai-did / _cfuvid cookie
+	//   (a) Bootstrap HEAD /                 —— 拿 __cf_bm / oai-did / _cfuvid cookie
 	//   (b) sentinel/chat-requirements       —— 拿 chat_token + proofofwork 描述
 	//   (c) f/conversation/prepare           —— 带 chat_token(!) + proof_token,拿 conduit_token
 	//   (d) f/conversation                   —— 带 chat_token + proof_token + conduit_token 发 SSE
@@ -296,8 +291,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	_ = cli.Bootstrap(bootCtx)
 	cancelBoot()
 
-	// (b) chat-requirements —— 优先走新两步协议(prepare + finalize),solver 未配置
-	// 或失败时会自动回退到单步老接口(V2 内部实现)。
+	// (b) chat-requirements —— 走新两步协议(prepare + 本地 solver + finalize)。
 	reqCtx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 
@@ -310,34 +304,36 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// POW(异步,5s 超时)
 	var proofToken string
 	if cr.Proofofwork.Required {
-		proofCtx, cancelProof := context.WithTimeout(c.Request.Context(), 5*time.Second)
-		proofCh := make(chan string, 1)
-		go func() { proofCh <- cr.SolveProof("") }()
-		select {
-		case <-proofCtx.Done():
-			cancelProof()
-			h.Scheduler.MarkWarned(c.Request.Context(), lease.Account.ID)
-			refund("pow_timeout")
-			openAIError(c, http.StatusServiceUnavailable, "pow_timeout",
-				"上游风控(PoW)未在规定时间内完成,请重试")
-			return
-		case proofToken = <-proofCh:
-			cancelProof()
+		proofToken = cr.ProofToken
+		if proofToken == "" {
+			proofCtx, cancelProof := context.WithTimeout(c.Request.Context(), 5*time.Second)
+			proofCh := make(chan string, 1)
+			go func() { proofCh <- cr.SolveProof("") }()
+			select {
+			case <-proofCtx.Done():
+				cancelProof()
+				h.Scheduler.MarkWarned(c.Request.Context(), lease.Account.ID)
+				refund("pow_timeout")
+				openAIError(c, http.StatusServiceUnavailable, "pow_timeout",
+					"服务验证未在规定时间内完成,请重试")
+				return
+			case proofToken = <-proofCh:
+				cancelProof()
+			}
 		}
 		if proofToken == "" {
 			h.Scheduler.MarkWarned(c.Request.Context(), lease.Account.ID)
 			refund("pow_failed")
 			openAIError(c, http.StatusServiceUnavailable, "pow_failed",
-				"上游风控(PoW)校验失败,请稍后重试")
+				"服务验证失败,请稍后重试")
 			return
 		}
 	}
-	// Turnstile 在新账号 / 新 device 场景几乎必现,但它实际上是"建议",
-	// 大多数情况下直接继续发 /conversation 也能被上游接受。这里只打 warn
-	// 日志,不阻断(参考 gen_image.py / chat2api 的通用做法)。
 	if cr.Turnstile.Required {
-		logger.L().Warn("chat turnstile required, continue anyway",
-			zap.Uint64("account_id", lease.Account.ID))
+		logger.L().Info("chat turnstile solved",
+			zap.Uint64("account_id", lease.Account.ID),
+			zap.Bool("has_turnstile_token", cr.TurnstileToken != ""),
+			zap.Int("turnstile_token_len", len(cr.TurnstileToken)))
 	}
 
 	// 免费账号(persona=chatgpt-freeaccount)对高级模型(如 gpt-5)会静默不生成,
@@ -348,13 +344,29 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			zap.Uint64("account_id", lease.Account.ID),
 			zap.String("requested_model", upstreamModel))
 		upstreamModel = "auto"
+		target.ThinkingEffort = ""
+	}
+
+	if target.ThinkingEffort != "" {
+		cfgCtx, cancelCfg := context.WithTimeout(c.Request.Context(), 15*time.Second)
+		cfgErr := cli.SetLastUsedModelConfig(cfgCtx, upstreamModel, target.ThinkingEffort)
+		cancelCfg()
+		if cfgErr != nil {
+			logger.L().Warn("chat settings/user_last_used_model_config failed",
+				zap.Uint64("account_id", lease.Account.ID),
+				zap.String("upstream_model", upstreamModel),
+				zap.String("thinking_effort", target.ThinkingEffort),
+				zap.Error(cfgErr))
+		}
 	}
 
 	chatOpt := chatgpt.FChatOpts{
-		UpstreamModel: upstreamModel,
-		Messages:      req.Messages,
-		ChatToken:     cr.Token,
-		ProofToken:    proofToken,
+		UpstreamModel:  upstreamModel,
+		Messages:       req.Messages,
+		ChatToken:      cr.Token,
+		ProofToken:     proofToken,
+		TurnstileToken: cr.TurnstileToken,
+		ThinkingEffort: target.ThinkingEffort,
 	}
 
 	// (c) f/conversation/prepare(必须在 chat-requirements 之后,且带 sentinel header)
@@ -569,7 +581,9 @@ func (h *Handler) handleUpstreamErr(c *gin.Context, lease *scheduler.Lease, err 
 		case ue.IsRateLimited():
 			h.Scheduler.MarkRateLimited(c.Request.Context(), lease.Account.ID)
 		case ue.IsUnauthorized():
-			h.Scheduler.MarkDead(c.Request.Context(), lease.Account.ID)
+			h.Scheduler.MarkDeadWithReason(c.Request.Context(), lease.Account.ID, "auth_required_401")
+		case ue.IsForbidden():
+			h.Scheduler.MarkSuspicious(c.Request.Context(), lease.Account.ID, "upstream_403")
 		}
 		refund()
 		logger.L().Error("chat upstream error",
@@ -577,11 +591,11 @@ func (h *Handler) handleUpstreamErr(c *gin.Context, lease *scheduler.Lease, err 
 			zap.Uint64("account_id", lease.Account.ID),
 			zap.String("body", truncate(ue.Body, 1500)))
 		openAIError(c, http.StatusBadGateway, "upstream_error",
-			fmt.Sprintf("上游返回错误(HTTP %d):%s", ue.Status, truncate(ue.Body, 200)))
+			fmt.Sprintf("服务返回错误(HTTP %d):%s", ue.Status, truncate(ue.Body, 200)))
 		return
 	}
 	refund()
-	openAIError(c, http.StatusBadGateway, "upstream_error", "上游请求失败:"+err.Error())
+	openAIError(c, http.StatusBadGateway, "upstream_error", "服务请求失败:"+err.Error())
 }
 
 func truncate(s string, n int) string {
@@ -608,15 +622,13 @@ func isSilentRejection(data []byte) bool {
 func emptyReplyMessage(freeAccount, silentlyRejected bool) string {
 	switch {
 	case silentlyRejected && freeAccount:
-		return "上游检测到当前账号为免费版(chatgpt-freeaccount),已静默拒绝本次请求。" +
-			"请联系管理员更换 ChatGPT Plus / Team 账号后再试。"
+		return "服务当前不可用,本次请求未产生内容。请稍后重试或联系管理员。"
 	case silentlyRejected:
-		return "上游已接受请求但静默终止对话(常见于账号被限流或触发内容审核)," +
-			"请稍后重试,若仍失败请更换模型或账号。"
+		return "请求已接收但未产生内容,可能触发内容审核或临时限流,请稍后重试。"
 	case freeAccount:
-		return "当前账号为 ChatGPT 免费版,上游未产出内容。请更换 Plus/Team 账号后再试。"
+		return "当前服务未产出内容。请稍后重试或联系管理员。"
 	default:
-		return "上游未产出回答内容,可能触发了内容审核或账号被临时限流,请稍后重试。"
+		return "服务未产出回答内容,可能触发内容审核或临时限流,请稍后重试。"
 	}
 }
 
@@ -641,9 +653,35 @@ func openAIError(c *gin.Context, httpStatus int, code, msg string) {
 		"error": gin.H{
 			"message": msg,
 			"type":    "invalid_request_error",
-			"code":    code,
+			"code":    publicOpenAIErrorCode(code),
 		},
 	})
+}
+
+// imageOpenAIError 为图片接口返回更干净的错误结构:保留 message/type,省略 code。
+// 这样上层机器人/插件不会把内部错误码再拼成 `[content_policy_rejected] ...` 给用户。
+func imageOpenAIError(c *gin.Context, httpStatus int, _ string, msg string) {
+	c.AbortWithStatusJSON(httpStatus, gin.H{
+		"error": gin.H{
+			"message": msg,
+			"type":    "invalid_request_error",
+		},
+	})
+}
+
+func publicOpenAIErrorCode(code string) string {
+	switch code {
+	case "upstream_error":
+		return "service_error"
+	case "upstream_init_error":
+		return "service_init_error"
+	case "upstream_timeout":
+		return "service_timeout"
+	case "upstream_unavailable":
+		return "service_unavailable"
+	default:
+		return code
+	}
 }
 
 // ListModels GET /v1/models
@@ -663,4 +701,24 @@ func (h *Handler) ListModels(c *gin.Context) {
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"object": "list", "data": data})
+}
+
+func persistGatewayLeaseCookies(lease *scheduler.Lease, client *chatgpt.Client) {
+	if lease == nil || client == nil {
+		return
+	}
+	raw, err := client.CookieJSON()
+	if err != nil || raw == "" || raw == "[]" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := lease.PersistCookies(ctx, raw); err != nil {
+		accountID := uint64(0)
+		if lease.Account != nil {
+			accountID = lease.Account.ID
+		}
+		logger.L().Warn("persist chat account cookies failed",
+			zap.Uint64("account_id", accountID), zap.Error(err))
+	}
 }

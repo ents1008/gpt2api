@@ -9,7 +9,11 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
-var ErrNotFound = errors.New("账号不存在")
+var (
+	ErrNotFound          = errors.New("账号不存在")
+	ErrRefreshConflict   = errors.New("account refresh was superseded by another writer")
+	ErrAdmissionConflict = errors.New("account admission observation was superseded by another writer")
+)
 
 type DAO struct{ db *sqlx.DB }
 
@@ -37,12 +41,18 @@ func (d *DAO) Create(ctx context.Context, a *Account) (uint64, error) {
 	res, err := d.db.ExecContext(ctx,
 		`INSERT INTO oai_accounts
          (email, auth_token_enc, refresh_token_enc, session_token_enc, token_expires_at,
-          oai_session_id, oai_device_id, client_id, chatgpt_account_id, account_type,
-          plan_type, daily_image_quota, status, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          oai_session_id, oai_device_id, client_id, refresh_client_id, credential_provenance, browser_profile,
+          chatgpt_account_id, account_type,
+          plan_type, daily_image_quota, status,
+          admission_state, admission_stage, admission_started_at, admission_next_check_at,
+          admission_last_check_at, admission_claimed_until, admission_reason, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.Email, a.AuthTokenEnc, a.RefreshTokenEnc, a.SessionTokenEnc, a.TokenExpiresAt,
-		a.OAISessionID, a.OAIDeviceID, a.ClientID, a.ChatGPTAccountID, a.AccountType,
-		a.PlanType, a.DailyImageQuota, a.Status, a.Notes,
+		a.OAISessionID, a.OAIDeviceID, a.ClientID, a.RefreshClientID, a.CredentialProvenance, a.BrowserProfile,
+		a.ChatGPTAccountID, a.AccountType,
+		a.PlanType, a.DailyImageQuota, a.Status,
+		a.AdmissionState, a.AdmissionStage, a.AdmissionStartedAt, a.AdmissionNextCheckAt,
+		a.AdmissionLastCheckAt, a.AdmissionClaimedUntil, a.AdmissionReason, a.Notes,
 	)
 	if err != nil {
 		return 0, err
@@ -107,22 +117,83 @@ func (d *DAO) List(ctx context.Context, status string, keyword string, offset, l
 
 // ListDispatchable 调度器专用:返回 AT 有效且 cooldown 到期的候选账号。
 //
-// 接受 status IN ('healthy', 'warned'):
+// 接受 status IN ('healthy', 'warned', 'suspicious')，以及带有明确且已
+// 到期 cooldown 的 throttled 账号:
 //   - healthy: 正常
 //   - warned:  RT/ST 刷新失败但 AT 尚未到期,仍可继续出图直到 AT 过期
+//   - suspicious: 403/风控等可恢复异常,冷却到期后低优先级复试
+//   - throttled: 上游额度/429 临时限流,冷却到期后最低优先级复试
+//
+// cooldown 为空的 throttled 账号视为人工或长期停用，不自动恢复。
 func (d *DAO) ListDispatchable(ctx context.Context, limit int) ([]*Account, error) {
 	rows := make([]*Account, 0, limit)
 	now := time.Now()
+	recentSince := now.Add(-24 * time.Hour)
 	err := d.db.SelectContext(ctx, &rows,
-		`SELECT * FROM oai_accounts
-         WHERE deleted_at IS NULL AND status IN ('healthy', 'warned')
-           AND (cooldown_until IS NULL OR cooldown_until <= ?)
-           AND (token_expires_at IS NULL OR token_expires_at > ?)
-         ORDER BY
-           CASE status WHEN 'healthy' THEN 0 ELSE 1 END,
-           CASE WHEN last_used_at IS NULL THEN 0 ELSE 1 END,
-           last_used_at ASC
-         LIMIT ?`, now, now, limit)
+		`SELECT a.* FROM oai_accounts a
+         LEFT JOIN (
+             SELECT account_id,
+                    SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS recent_successes,
+                    SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS recent_failures,
+                    MAX(CASE WHEN status='success' THEN finished_at ELSE NULL END) AS last_success_at,
+                    MAX(CASE WHEN status='failed' THEN finished_at ELSE NULL END) AS last_failure_at
+               FROM image_tasks
+              WHERE created_at >= ?
+                AND account_id > 0
+              GROUP BY account_id
+         ) recent ON recent.account_id = a.id
+         WHERE a.deleted_at IS NULL
+           AND a.admission_state = 'admitted'
+           AND (a.status IN ('healthy', 'warned', 'suspicious')
+                OR (a.status='throttled' AND a.cooldown_until IS NOT NULL))
+           AND (a.cooldown_until IS NULL OR a.cooldown_until <= ?)
+           AND (a.token_expires_at IS NULL OR a.token_expires_at > ?)
+          ORDER BY
+           CASE a.status WHEN 'healthy' THEN 0 WHEN 'warned' THEN 1 WHEN 'suspicious' THEN 2 WHEN 'throttled' THEN 3 ELSE 4 END,
+           CASE
+             WHEN a.status='suspicious'
+              AND COALESCE(recent.recent_successes, 0) > 0
+              AND (recent.last_failure_at IS NULL OR recent.last_success_at > recent.last_failure_at)
+             THEN 0
+             WHEN a.status='suspicious' THEN 1
+             ELSE 0
+           END,
+           CASE
+             WHEN a.status='suspicious'
+              AND COALESCE(recent.recent_successes, 0) > 0
+              AND (recent.last_failure_at IS NULL OR recent.last_success_at > recent.last_failure_at)
+             THEN recent.last_success_at
+             ELSE NULL
+           END DESC,
+           CASE
+             WHEN a.status='suspicious' THEN
+               CASE COALESCE(a.refresh_error, '')
+                 WHEN 'upstream_network_transient' THEN 0
+                 WHEN 'network_transient' THEN 1
+                 WHEN 'download_failed' THEN 2
+                 WHEN 'conversation_poll_error' THEN 3
+                 WHEN 'image_task_stalled' THEN 4
+                 WHEN 'image_tool_without_asset' THEN 5
+                 WHEN 'poll_timeout' THEN 6
+                 WHEN 'upstream_403' THEN 7
+                 WHEN 'proxy_connect_403' THEN 8
+                 WHEN 'turnstile_stalled' THEN 9
+                 ELSE 10
+               END
+             ELSE 0
+           END,
+           CASE
+             WHEN a.status='suspicious' THEN
+               CASE
+                 WHEN a.image_quota_remaining > 0 THEN 0
+                 WHEN a.image_quota_remaining < 0 THEN 1
+                 ELSE 2
+               END
+             ELSE 0
+           END,
+           CASE WHEN a.last_used_at IS NULL THEN 0 ELSE 1 END,
+           a.last_used_at ASC
+         LIMIT ?`, recentSince, now, now, limit)
 	fillAll(rows)
 	return rows, err
 }
@@ -137,19 +208,135 @@ func (d *DAO) ListNeedRefresh(ctx context.Context, aheadSec int, limit int) ([]*
          WHERE deleted_at IS NULL
            AND status <> 'dead'
            AND (refresh_token_enc IS NOT NULL OR session_token_enc IS NOT NULL)
+           AND NOT (admission_state = ? AND credential_provenance IN (?, ?))
            AND token_expires_at IS NOT NULL
            AND token_expires_at <= ?
          ORDER BY token_expires_at ASC
-         LIMIT ?`, threshold, limit)
+         LIMIT ?`,
+		AdmissionStateQuarantined,
+		CredentialProvenanceWebOnly,
+		CredentialProvenanceBrowserWeb,
+		threshold,
+		limit,
+	)
 	fillAll(rows)
 	return rows, err
 }
 
+func (d *DAO) ListDueAdmissions(ctx context.Context, now time.Time, limit int) ([]*Account, error) {
+	rows := make([]*Account, 0, limit)
+	err := d.db.SelectContext(ctx, &rows,
+		`SELECT * FROM oai_accounts
+         WHERE deleted_at IS NULL
+           AND status <> 'dead'
+           AND admission_state = 'quarantined'
+           AND admission_next_check_at IS NOT NULL
+           AND admission_next_check_at <= ?
+           AND (admission_claimed_until IS NULL OR admission_claimed_until <= ?)
+         ORDER BY admission_next_check_at ASC
+         LIMIT ?`, now, now, limit)
+	fillAll(rows)
+	return rows, err
+}
+
+func (d *DAO) ClaimAdmissionCheck(
+	ctx context.Context,
+	id uint64,
+	expectedStage int,
+	expectedStartedAt time.Time,
+	now time.Time,
+	claimedUntil time.Time,
+) (bool, error) {
+	res, err := d.db.ExecContext(ctx,
+		`UPDATE oai_accounts
+         SET admission_claimed_until = ?
+         WHERE id = ? AND deleted_at IS NULL
+           AND admission_state = 'quarantined'
+           AND admission_next_check_at IS NOT NULL
+           AND admission_next_check_at <= ?
+           AND admission_stage = ? AND admission_started_at = ?
+           AND (admission_claimed_until IS NULL OR admission_claimed_until <= ?)`,
+		claimedUntil, id, now, expectedStage, expectedStartedAt, now)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+func (d *DAO) ApplyAdmissionTransition(
+	ctx context.Context,
+	id uint64,
+	expectedStage int,
+	expectedStartedAt time.Time,
+	transition admissionTransition,
+	checkedAt time.Time,
+) error {
+	res, err := d.db.ExecContext(ctx,
+		`UPDATE oai_accounts
+         SET admission_state = ?, admission_stage = ?, admission_started_at = ?,
+             admission_next_check_at = ?, admission_last_check_at = ?,
+             admission_claimed_until = NULL, admission_reason = ?
+         WHERE id = ? AND deleted_at IS NULL
+           AND admission_state = 'quarantined' AND admission_stage = ?
+           AND admission_started_at = ?`,
+		transition.State, transition.Stage, transition.StartedAt,
+		transition.NextCheckAt, checkedAt, transition.Reason, id, expectedStage, expectedStartedAt)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrAdmissionConflict
+	}
+	return nil
+}
+
+func (d *DAO) RetryAdmissionCheck(
+	ctx context.Context,
+	id uint64,
+	expectedStage int,
+	expectedStartedAt time.Time,
+	next time.Time,
+	reason string,
+) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE oai_accounts
+         SET admission_next_check_at = ?, admission_last_check_at = ?,
+             admission_claimed_until = NULL, admission_reason = ?
+         WHERE id = ? AND deleted_at IS NULL AND admission_state = 'quarantined'
+           AND admission_stage = ? AND admission_started_at = ?`,
+		next, time.Now(), reason, id, expectedStage, expectedStartedAt)
+	return err
+}
+
+func (d *DAO) RejectAdmission(
+	ctx context.Context,
+	id uint64,
+	expectedStage int,
+	expectedStartedAt time.Time,
+	reason string,
+) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE oai_accounts
+         SET admission_state = 'rejected', admission_next_check_at = NULL,
+             admission_last_check_at = ?, admission_claimed_until = NULL,
+             admission_reason = ?, status = 'dead', refresh_error = ?
+         WHERE id = ? AND deleted_at IS NULL AND admission_state = 'quarantined'
+           AND admission_stage = ? AND admission_started_at = ?`,
+		time.Now(), reason, reason, id, expectedStage, expectedStartedAt)
+	return err
+}
+
 // ListNeedProbeQuota 返回需要探测图片额度的账号。命中以下任一条件即纳入:
-//   (a) 从未探测过(image_quota_updated_at IS NULL);
-//   (b) 上次探测超过 minIntervalSec 秒(常规轮询);
-//   (c) **剩余额度=0 且已过 reset_at**:这种"归零等重置"的账号要第一时间补探,
-//       不受 minIntervalSec 限制,避免 5 小时轮询间隔导致的额度恢复滞后显示。
+//
+//	(a) 从未探测过(image_quota_updated_at IS NULL);
+//	(b) 上次探测超过 minIntervalSec 秒(常规轮询);
+//	(c) **剩余额度=0 且已过 reset_at**:这种"归零等重置"的账号要第一时间补探,
+//	    不受 minIntervalSec 限制,避免 5 小时轮询间隔导致的额度恢复滞后显示。
 func (d *DAO) ListNeedProbeQuota(ctx context.Context, minIntervalSec int, limit int) ([]*Account, error) {
 	rows := make([]*Account, 0, limit)
 	threshold := time.Now().Add(-time.Duration(minIntervalSec) * time.Second)
@@ -157,6 +344,7 @@ func (d *DAO) ListNeedProbeQuota(ctx context.Context, minIntervalSec int, limit 
 		`SELECT * FROM oai_accounts
          WHERE deleted_at IS NULL
            AND status = 'healthy'
+           AND admission_state = 'admitted'
            AND (token_expires_at IS NULL OR token_expires_at > NOW())
            AND (
                 image_quota_updated_at IS NULL
@@ -177,6 +365,21 @@ func (d *DAO) ListAllActiveIDs(ctx context.Context) ([]uint64, error) {
 	err := d.db.SelectContext(ctx, &ids,
 		`SELECT id FROM oai_accounts WHERE deleted_at IS NULL ORDER BY id ASC`)
 	return ids, err
+}
+
+// ListAllActive 返回未软删账号实体,用于管理员手动全量额度探测。
+func (d *DAO) ListAllActive(ctx context.Context, limit int) ([]*Account, error) {
+	rows := make([]*Account, 0, 128)
+	var err error
+	if limit > 0 {
+		err = d.db.SelectContext(ctx, &rows,
+			`SELECT * FROM oai_accounts WHERE deleted_at IS NULL ORDER BY id ASC LIMIT ?`, limit)
+	} else {
+		err = d.db.SelectContext(ctx, &rows,
+			`SELECT * FROM oai_accounts WHERE deleted_at IS NULL ORDER BY id ASC`)
+	}
+	fillAll(rows)
+	return rows, err
 }
 
 // QuotaSummary 全局额度汇总。
@@ -205,14 +408,20 @@ func (d *DAO) Update(ctx context.Context, a *Account) error {
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE oai_accounts
          SET email=?, auth_token_enc=?, refresh_token_enc=?, session_token_enc=?, token_expires_at=?,
-             oai_session_id=?, oai_device_id=?, client_id=?, chatgpt_account_id=?, account_type=?,
+             oai_session_id=?, oai_device_id=?, client_id=?, refresh_client_id=?, credential_provenance=?, browser_profile=?,
+             chatgpt_account_id=?, account_type=?,
              plan_type=?, daily_image_quota=?,
-             status=?, notes=?
+             status=?, admission_state=?, admission_stage=?, admission_started_at=?,
+             admission_next_check_at=?, admission_last_check_at=?, admission_claimed_until=?,
+             admission_reason=?, notes=?
          WHERE id = ? AND deleted_at IS NULL`,
 		a.Email, a.AuthTokenEnc, a.RefreshTokenEnc, a.SessionTokenEnc, a.TokenExpiresAt,
-		a.OAISessionID, a.OAIDeviceID, a.ClientID, a.ChatGPTAccountID, a.AccountType,
+		a.OAISessionID, a.OAIDeviceID, a.ClientID, a.RefreshClientID, a.CredentialProvenance, a.BrowserProfile,
+		a.ChatGPTAccountID, a.AccountType,
 		a.PlanType, a.DailyImageQuota,
-		a.Status, a.Notes, a.ID,
+		a.Status, a.AdmissionState, a.AdmissionStage, a.AdmissionStartedAt,
+		a.AdmissionNextCheckAt, a.AdmissionLastCheckAt, a.AdmissionClaimedUntil,
+		a.AdmissionReason, a.Notes, a.ID,
 	)
 	return err
 }
@@ -297,10 +506,28 @@ func (d *DAO) MarkUsed(ctx context.Context, id uint64, today time.Time) error {
 
 // SetStatus 迁移状态,可选 cooldownUntil。
 func (d *DAO) SetStatus(ctx context.Context, id uint64, status string, cooldownUntil *time.Time) error {
+	return d.SetStatusReason(ctx, id, status, cooldownUntil, "")
+}
+
+// SetStatusReason 迁移状态并记录机器可读原因。原因写入 refresh_error,
+// 让后台能直接看到账号为什么被降级/打死。
+func (d *DAO) SetStatusReason(ctx context.Context, id uint64, status string, cooldownUntil *time.Time, reason string) error {
 	if cooldownUntil != nil {
+		if reason != "" {
+			_, err := d.db.ExecContext(ctx,
+				`UPDATE oai_accounts SET status=?, cooldown_until=?, refresh_error=? WHERE id=?`,
+				status, *cooldownUntil, reason, id)
+			return err
+		}
 		_, err := d.db.ExecContext(ctx,
 			`UPDATE oai_accounts SET status=?, cooldown_until=? WHERE id=?`,
 			status, *cooldownUntil, id)
+		return err
+	}
+	if reason != "" {
+		_, err := d.db.ExecContext(ctx,
+			`UPDATE oai_accounts SET status=?, cooldown_until=NULL, refresh_error=? WHERE id=?`,
+			status, reason, id)
 		return err
 	}
 	_, err := d.db.ExecContext(ctx,
@@ -309,19 +536,40 @@ func (d *DAO) SetStatus(ctx context.Context, id uint64, status string, cooldownU
 	return err
 }
 
+// RestoreHealthy clears transient image-runtime failures after a later
+// successful dispatch. A successful image proves that both a suspicious
+// runtime failure and an expired throttled quota/rate-limit state recovered.
+// Dead accounts and throttled accounts without a dispatchable cooldown never
+// reach this path and remain excluded.
+func (d *DAO) RestoreHealthy(ctx context.Context, id uint64) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE oai_accounts
+         SET status='healthy', cooldown_until=NULL, refresh_error=''
+         WHERE id=? AND deleted_at IS NULL AND status IN ('suspicious', 'throttled')`,
+		id)
+	return err
+}
+
 // ApplyRefreshResult 原子更新 AT / RT + 过期时间 + 最近刷新信息。
 // newRTEnc 为空字符串表示 RT 没有轮转,保持不变。
 func (d *DAO) ApplyRefreshResult(
 	ctx context.Context,
 	id uint64,
+	expectedRTEnc string,
 	newATEnc string,
 	newRTEnc string,
 	expiresAt time.Time,
 	source string,
 ) error {
-	var err error
+	var (
+		res sql.Result
+		err error
+	)
+	if source == RefreshSourceRT && expectedRTEnc == "" {
+		return ErrRefreshConflict
+	}
 	if newRTEnc != "" {
-		_, err = d.db.ExecContext(ctx,
+		res, err = d.db.ExecContext(ctx,
 			`UPDATE oai_accounts
              SET auth_token_enc = ?,
                  refresh_token_enc = ?,
@@ -329,22 +577,80 @@ func (d *DAO) ApplyRefreshResult(
                  last_refresh_at = ?,
                  last_refresh_source = ?,
                  refresh_error = '',
-                 status = CASE WHEN status IN ('dead','suspicious') THEN 'healthy' ELSE status END
-             WHERE id = ? AND deleted_at IS NULL`,
-			newATEnc, newRTEnc, expiresAt, time.Now(), source, id)
-	} else {
-		_, err = d.db.ExecContext(ctx,
+                 cooldown_until = CASE WHEN status='throttled' THEN cooldown_until ELSE NULL END,
+                 warned_at = NULL,
+                 status = CASE WHEN status IN ('dead','suspicious','warned') THEN 'healthy' ELSE status END
+			 WHERE id = ? AND deleted_at IS NULL AND refresh_token_enc = ?`,
+			newATEnc, newRTEnc, expiresAt, time.Now(), source, id, expectedRTEnc)
+	} else if source == RefreshSourceRT {
+		res, err = d.db.ExecContext(ctx,
 			`UPDATE oai_accounts
              SET auth_token_enc = ?,
                  token_expires_at = ?,
                  last_refresh_at = ?,
                  last_refresh_source = ?,
                  refresh_error = '',
-                 status = CASE WHEN status IN ('dead','suspicious') THEN 'healthy' ELSE status END
+                 cooldown_until = CASE WHEN status='throttled' THEN cooldown_until ELSE NULL END,
+                 warned_at = NULL,
+                 status = CASE WHEN status IN ('dead','suspicious','warned') THEN 'healthy' ELSE status END
+             WHERE id = ? AND deleted_at IS NULL AND refresh_token_enc = ?`,
+			newATEnc, expiresAt, time.Now(), source, id, expectedRTEnc)
+	} else {
+		res, err = d.db.ExecContext(ctx,
+			`UPDATE oai_accounts
+             SET auth_token_enc = ?,
+                 token_expires_at = ?,
+                 last_refresh_at = ?,
+                 last_refresh_source = ?,
+                 refresh_error = '',
+                 cooldown_until = CASE WHEN status='throttled' THEN cooldown_until ELSE NULL END,
+                 warned_at = NULL,
+                 status = CASE WHEN status IN ('dead','suspicious','warned') THEN 'healthy' ELSE status END
              WHERE id = ? AND deleted_at IS NULL`,
 			newATEnc, expiresAt, time.Now(), source, id)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	if source == RefreshSourceRT {
+		n, rowsErr := res.RowsAffected()
+		if rowsErr != nil {
+			return rowsErr
+		}
+		if n != 1 {
+			return ErrRefreshConflict
+		}
+	}
+	return nil
+}
+
+func (d *DAO) RotateRefreshTokenCAS(
+	ctx context.Context,
+	id uint64,
+	expectedRTEnc string,
+	newRTEnc string,
+	reason string,
+) error {
+	if expectedRTEnc == "" || newRTEnc == "" {
+		return ErrRefreshConflict
+	}
+	res, err := d.db.ExecContext(ctx,
+		`UPDATE oai_accounts
+         SET refresh_token_enc = ?, last_refresh_at = ?,
+             last_refresh_source = ?, refresh_error = ?
+         WHERE id = ? AND deleted_at IS NULL AND refresh_token_enc = ?`,
+		newRTEnc, time.Now(), RefreshSourceRT, reason, id, expectedRTEnc)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrRefreshConflict
+	}
+	return nil
 }
 
 // RecordRefreshError 写入刷新失败原因,同时推进 last_refresh_at(避免 pressed-out 重试)。
@@ -358,6 +664,7 @@ func (d *DAO) RecordRefreshError(ctx context.Context, id uint64, source string, 
 			`UPDATE oai_accounts
              SET last_refresh_at = ?, last_refresh_source = ?, refresh_error = ?,
                  status = CASE
+                   WHEN status = 'dead' THEN 'dead'
                    WHEN token_expires_at IS NOT NULL AND token_expires_at > NOW() THEN 'warned'
                    ELSE 'dead'
                  END
@@ -389,6 +696,11 @@ func (d *DAO) ApplyQuotaResult(ctx context.Context, id uint64, remaining, total 
 	}
 	_, err := d.db.ExecContext(ctx, q, remaining, remaining, total, total, reset, time.Now(), id)
 	return err
+}
+
+// MarkQuotaDepleted records a definitive upstream image quota limit result.
+func (d *DAO) MarkQuotaDepleted(ctx context.Context, accountID uint64, resetAt *time.Time) error {
+	return d.ApplyQuotaResult(ctx, accountID, 0, -1, resetAt)
 }
 
 // DecrQuota 生图成功后立即乐观扣减账号剩余额度。

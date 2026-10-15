@@ -334,14 +334,29 @@ func (p *Prober) applyResult(ctx context.Context, pr *Proxy, r ProbeResult) {
 			score = 0
 		}
 		lastErr = r.Error
-		if len(lastErr) > 200 {
-			lastErr = lastErr[:200]
-		}
+		lastErr = truncateProbeError(lastErr, 200)
 	}
 	if err := p.svc.dao.UpdateHealth(ctx, pr.ID, score, lastErr); err != nil {
 		p.log.Warn("prober: update health failed",
 			zap.Uint64("proxy_id", pr.ID), zap.Error(err))
 	}
+}
+
+func truncateProbeError(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return s
+	}
+	end := 0
+	for i := range s {
+		if i > maxBytes {
+			break
+		}
+		end = i
+	}
+	if end == 0 {
+		return ""
+	}
+	return s[:end]
 }
 
 // shortenErr 把网络错误压成一行、对前端友好的中文字符串。

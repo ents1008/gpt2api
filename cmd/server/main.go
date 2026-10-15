@@ -144,7 +144,6 @@ func main() {
 		Groups:    groupCache,
 		Limiter:   limiter,
 		Usage:     usageLogger,
-		AccSvc:    accSvc,
 		Channels:  channelRouter,
 	}
 
@@ -239,19 +238,22 @@ func main() {
 	defer cancelProber()
 	go prober.Run(proberCtx)
 
-	// 账号池:AT 刷新器 + 额度探测器
+	// 账号池:AT 刷新器 + 图片额度探测器。后台额度探测仍由 settings 控制;
+	// 管理端手动探测复用同一套账号代理、设备指纹和浏览器 bootstrap 链路。
 	accountH := account.NewHandler(accSvc)
 	accRefresher := account.NewRefresher(accSvc, settingsSvc, log.Named("account-refresh"))
-	accQuota := account.NewQuotaProber(accSvc, settingsSvc, log.Named("account-quota"))
+	quotaProber := account.NewQuotaProber(accSvc, settingsSvc, log.Named("account-quota"))
+	admissionMonitor := account.NewAdmissionMonitor(accDAO, accRefresher, log.Named("account-admission"))
 
-	// 账号→代理 解析器:让 refresh / probe 走账号自身绑定的代理,
-	// 避免从境内直连 chatgpt.com / auth.openai.com 时被中间设备 TLS 劫持。
+	// 账号→代理 解析器:让 refresh 走账号自身绑定的代理,
+	// 避免从境内直连 auth.openai.com 时被中间设备 TLS 劫持。
 	acctProxyResolver := &accountProxyResolver{accSvc: accSvc, proxySvc: proxySvc}
 	accRefresher.SetProxyResolver(acctProxyResolver)
-	accQuota.SetProxyResolver(acctProxyResolver)
+	quotaProber.SetProxyResolver(acctProxyResolver)
+	imageRunner.SetAccountRecovery(accRefresher)
 
 	accountH.SetRefresher(accRefresher)
-	accountH.SetProber(accQuota)
+	accountH.SetQuotaProber(quotaProber)
 	accountH.SetSettings(settingsSvc)
 	accountH.SetProxyResolver(acctProxyResolver)
 
@@ -261,7 +263,8 @@ func main() {
 	accBgCtx, cancelAccBg := context.WithCancel(context.Background())
 	defer cancelAccBg()
 	go accRefresher.Run(accBgCtx)
-	go accQuota.Run(accBgCtx)
+	go quotaProber.Run(accBgCtx)
+	go admissionMonitor.Run(accBgCtx)
 
 	deps := &server.Deps{
 		Config: cfg,

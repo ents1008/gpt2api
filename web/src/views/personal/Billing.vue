@@ -37,7 +37,7 @@ async function loadOrders() {
 }
 
 /**
- * 下单 -> 打开 pay_url(上游收银台)
+ * 下单 -> 打开 pay_url(支付收银台)
  * 返回后用户点"刷新"即可拉到最新订单状态(支付回调已异步把 pending -> paid)。
  */
 async function buy(pkg: rechargeApi.Package, payType?: string) {

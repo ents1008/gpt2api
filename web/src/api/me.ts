@@ -180,6 +180,12 @@ export interface PlayChatMessage {
   content: string
 }
 
+export type PlayChatReasoningEffort = 'low' | 'medium' | 'high'
+
+export interface PlayChatReasoning {
+  effort?: PlayChatReasoningEffort
+}
+
 // streamPlayChat 直接用 fetch 读 SSE,因为 axios 不擅长流式。
 // 回调 onDelta 每接到一段 content 增量触发;流结束时 promise resolve。
 export async function streamPlayChat(
@@ -187,6 +193,7 @@ export async function streamPlayChat(
     model: string
     messages: PlayChatMessage[]
     temperature?: number
+    reasoning?: PlayChatReasoning
   },
   onDelta: (text: string) => void,
   signal?: AbortSignal,

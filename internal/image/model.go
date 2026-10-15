@@ -27,7 +27,9 @@ const (
 const (
 	ErrUnknown               = "unknown"
 	ErrNoAccount             = "no_available_account"
+	ErrQuotaDepleted         = "image_quota_depleted"
 	ErrAuthRequired          = "auth_required"
+	ErrUpstreamForbidden     = "upstream_forbidden"
 	ErrRateLimited           = "rate_limited"
 	ErrNetworkTransient      = "network_transient" // 瞬态网络错误(EOF / reset),可自动重试
 	ErrPOWTimeout            = "pow_timeout"

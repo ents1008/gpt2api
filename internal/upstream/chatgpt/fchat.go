@@ -5,7 +5,7 @@
 // 等同于"被静默拒绝"。对齐浏览器抓包与社区维护的 OpenaiChat provider,
 // 文字聊天正确顺序是:
 //
-//	1. GET /                            → 拿 __cf_bm / oai-did / _cfuvid cookie
+//	1. HEAD /                           → 拿 __cf_bm / oai-did / _cfuvid cookie
 //	2. sentinel/chat-requirements       → 拿 chat_token + proofofwork 挑战
 //	3. f/conversation/prepare           → 带 chat_token(!) + proof_token,拿 conduit_token
 //	4. f/conversation (SSE)             → 带 chat_token + proof_token + conduit_token
@@ -30,14 +30,17 @@ import (
 
 // FChatOpts 是 StreamFChat 的入参。
 type FChatOpts struct {
-	UpstreamModel string        // 默认 "auto"
-	Messages      []ChatMessage // OpenAI 风格
-	ChatToken     string        // 必传(StreamFChat 时,PrepareFChat 不需要)
-	ProofToken    string        // 可选
-	ConduitToken  string        // 可选(PrepareFChat 返回)
-	ConvID        string        // 复用会话时传
-	ParentMsgID   string        // 复用会话时传 GetConversationHead 结果
-	SSETimeout    time.Duration // 默认 120s
+	UpstreamModel  string        // 默认 "auto"
+	Messages       []ChatMessage // OpenAI 风格
+	ChatToken      string        // 必传(StreamFChat 时,PrepareFChat 不需要)
+	ProofToken     string        // 可选
+	TurnstileToken string        // 可选,来自 ChatRequirementsV2
+	ConduitToken   string        // 可选(PrepareFChat 返回)
+	ConvID         string        // 复用会话时传
+	ParentMsgID    string        // 复用会话时传 GetConversationHead 结果
+	TurnTraceID    string        // 同一轮 prepare + stream 复用同一个 trace id
+	ThinkingEffort string        // thinking 模型时带进 prepare / stream payload
+	SSETimeout     time.Duration // 默认 120s
 }
 
 // PrepareFChat 对 /backend-api/f/conversation/prepare 发一条文字 prepare,返回 conduit_token。
@@ -63,6 +66,9 @@ func (c *Client) PrepareFChat(ctx context.Context, opt FChatOpts) (string, error
 	if opt.ParentMsgID == "" {
 		opt.ParentMsgID = uuid.NewString()
 	}
+	if opt.TurnTraceID == "" {
+		opt.TurnTraceID = uuid.NewString()
+	}
 
 	// partial_query 用最后一条 user message。浏览器的做法是"用户一输完字就发
 	// prepare",此时还没 send,所以 partial_query = 当前正在输入的内容。
@@ -79,9 +85,9 @@ func (c *Client) PrepareFChat(ctx context.Context, opt FChatOpts) (string, error
 		"fork_from_shared_post": false,
 		"parent_message_id":     opt.ParentMsgID,
 		"model":                 opt.UpstreamModel,
-		"client_prepare_state":  "success",
-		"timezone_offset_min":   -480,
-		"timezone":              "Asia/Shanghai",
+		"client_prepare_state":  "none",
+		"timezone_offset_min":   c.profile.TimezoneOffsetMinutes(time.Now()),
+		"timezone":              c.profile.Timezone,
 		"conversation_mode":     map[string]string{"kind": "primary_assistant"},
 		"system_hints":          []string{},
 		"partial_query": map[string]interface{}{
@@ -101,6 +107,9 @@ func (c *Client) PrepareFChat(ctx context.Context, opt FChatOpts) (string, error
 	if opt.ConvID != "" {
 		payload["conversation_id"] = opt.ConvID
 	}
+	if opt.ThinkingEffort != "" {
+		payload["thinking_effort"] = opt.ThinkingEffort
+	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.opts.BaseURL+"/backend-api/f/conversation/prepare",
@@ -111,9 +120,14 @@ func (c *Client) PrepareFChat(ctx context.Context, opt FChatOpts) (string, error
 	c.commonHeaders(req)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "*/*")
+	req.Header.Set("X-Conduit-Token", "no-token")
+	req.Header.Set("X-Oai-Turn-Trace-Id", opt.TurnTraceID)
 	req.Header.Set("Openai-Sentinel-Chat-Requirements-Token", opt.ChatToken)
 	if opt.ProofToken != "" {
 		req.Header.Set("Openai-Sentinel-Proof-Token", opt.ProofToken)
+	}
+	if opt.TurnstileToken != "" {
+		req.Header.Set("Openai-Sentinel-Turnstile-Token", opt.TurnstileToken)
 	}
 
 	res, err := c.hc.Do(req)
@@ -146,6 +160,9 @@ func (c *Client) StreamFChat(ctx context.Context, opt FChatOpts) (<-chan SSEEven
 	}
 	if opt.ParentMsgID == "" {
 		opt.ParentMsgID = uuid.NewString()
+	}
+	if opt.TurnTraceID == "" {
+		opt.TurnTraceID = uuid.NewString()
 	}
 	if opt.SSETimeout == 0 {
 		opt.SSETimeout = 120 * time.Second
@@ -187,8 +204,8 @@ func (c *Client) StreamFChat(ctx context.Context, opt FChatOpts) (<-chan SSEEven
 		"parent_message_id":        opt.ParentMsgID,
 		"model":                    opt.UpstreamModel,
 		"client_prepare_state":     "sent",
-		"timezone_offset_min":      -480,
-		"timezone":                 "Asia/Shanghai",
+		"timezone_offset_min":      c.profile.TimezoneOffsetMinutes(time.Now()),
+		"timezone":                 c.profile.Timezone,
 		"conversation_mode":        map[string]string{"kind": "primary_assistant"},
 		"enable_message_followups": true,
 		"system_hints":             []string{},
@@ -211,6 +228,9 @@ func (c *Client) StreamFChat(ctx context.Context, opt FChatOpts) (<-chan SSEEven
 	if opt.ConvID != "" {
 		payload["conversation_id"] = opt.ConvID
 	}
+	if opt.ThinkingEffort != "" {
+		payload["thinking_effort"] = opt.ThinkingEffort
+	}
 	body, _ := json.Marshal(payload)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -224,10 +244,13 @@ func (c *Client) StreamFChat(ctx context.Context, opt FChatOpts) (<-chan SSEEven
 	req.Header.Set("Accept", "text/event-stream")
 	// X-Oai-Turn-Trace-Id:真实浏览器每 turn 一个新 UUID。风控会据此做请求配对
 	// (prepare 与 finalize / f-prepare 与 f-conversation 的 trace 对得上)。
-	req.Header.Set("X-Oai-Turn-Trace-Id", uuid.NewString())
+	req.Header.Set("X-Oai-Turn-Trace-Id", opt.TurnTraceID)
 	req.Header.Set("Openai-Sentinel-Chat-Requirements-Token", opt.ChatToken)
 	if opt.ProofToken != "" {
 		req.Header.Set("Openai-Sentinel-Proof-Token", opt.ProofToken)
+	}
+	if opt.TurnstileToken != "" {
+		req.Header.Set("Openai-Sentinel-Turnstile-Token", opt.TurnstileToken)
 	}
 	if opt.ConduitToken != "" {
 		req.Header.Set("X-Conduit-Token", opt.ConduitToken)
@@ -245,8 +268,7 @@ func (c *Client) StreamFChat(ctx context.Context, opt FChatOpts) (<-chan SSEEven
 		res.Body.Close()
 		return nil, &UpstreamError{Status: res.StatusCode, Message: "f/conversation(chat) failed", Body: string(buf)}
 	}
-	out := make(chan SSEEvent, 64)
-	go parseSSE(res.Body, out, opt.SSETimeout)
-	return out, nil
+	raw := make(chan SSEEvent, 64)
+	go parseSSE(res.Body, raw, opt.SSETimeout)
+	return c.wrapFChatStream(ctx, raw, opt.SSETimeout), nil
 }
-

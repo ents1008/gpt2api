@@ -1,7 +1,6 @@
 package account
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -12,6 +11,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/432539/gpt2api/internal/upstream/chatgpt"
 )
 
 // ImportTokenMode 批量 token 导入的模式。
@@ -243,21 +244,10 @@ func buildImportHTTPClient(proxyURL string) *http.Client {
 
 // rtExchange 与 refresher.rtToAT 等价的包级实现(不需要 account_id)。
 func rtExchange(ctx context.Context, httpc *http.Client, rt, clientID string) (newAT, newRT string, expAt time.Time, err error) {
-	body := map[string]string{
-		"client_id":     clientID,
-		"grant_type":    "refresh_token",
-		"redirect_uri":  "com.openai.chat://auth0.openai.com/ios/com.openai.chat/callback",
-		"refresh_token": rt,
-	}
-	buf, _ := json.Marshal(body)
-	req, err := http.NewRequestWithContext(ctx, "POST",
-		"https://auth.openai.com/oauth/token", bytes.NewReader(buf))
+	req, err := newOAuthRefreshRequest(ctx, rt, clientID)
 	if err != nil {
 		return
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "ChatGPT/1.2025.122 (iOS 18.2; iPhone15,2; build 15096)")
 	resp, err := httpc.Do(req)
 	if err != nil {
 		return
@@ -296,8 +286,7 @@ func stExchange(ctx context.Context, httpc *http.Client, st string) (newAT strin
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Referer", "https://chatgpt.com/")
-	req.Header.Set("User-Agent",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	chatgpt.ApplyDefaultBrowserFingerprintHeaders(req.Header)
 	req.AddCookie(&http.Cookie{Name: "__Secure-next-auth.session-token", Value: st})
 
 	resp, err := httpc.Do(req)

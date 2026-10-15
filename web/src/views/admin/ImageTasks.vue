@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
 import { http } from '@/api/http'
-import { formatDateTime } from '@/utils/format'
+import { formatDateTime, formatImageTaskError } from '@/utils/format'
 
 interface TaskRow {
   id: number
@@ -123,14 +123,18 @@ onMounted(fetchList)
             <el-tag :type="statusColor[row.status] || 'info'" size="small">{{ row.status }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="结果" width="80">
+        <el-table-column label="结果" min-width="170">
           <template #default="{ row }">
             <el-button
               v-if="row.result_urls_parsed?.length"
               type="primary" link size="small"
               @click="openPreview(row)"
             >预览({{ row.result_urls_parsed.length }})</el-button>
-            <span v-else-if="row.error" style="font-size:11px;color:var(--el-color-danger)" :title="row.error">失败</span>
+            <el-tooltip v-else-if="row.error" :content="row.error" placement="top">
+              <span style="font-size:11px;color:var(--el-color-danger)">
+                {{ formatImageTaskError(row.error) }}
+              </span>
+            </el-tooltip>
             <span v-else style="color:var(--el-text-color-secondary)">-</span>
           </template>
         </el-table-column>
@@ -185,7 +189,7 @@ onMounted(fetchList)
           </a>
         </div>
         <div v-if="previewRow.error" style="margin-top:12px;color:var(--el-color-danger);font-size:12px;word-break:break-all">
-          错误:{{ previewRow.error }}
+          错误:{{ formatImageTaskError(previewRow.error) }}
         </div>
       </div>
     </el-dialog>

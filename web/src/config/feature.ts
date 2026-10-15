@@ -8,4 +8,4 @@
 // solver 接入前静默拒绝率很高,先把用户入口隐藏掉,避免误用扣费。后端路由
 // (/v1/chat/completions / /api/me/playground/chat)保留,方便后续重新开启
 // 和调试使用。
-export const ENABLE_CHAT_MODEL = false
+export const ENABLE_CHAT_MODEL = true
